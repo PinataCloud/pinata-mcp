@@ -1,4 +1,5 @@
 # pinata-mcp
+[![smithery badge](https://smithery.ai/badge/@PinataCloud/pinata-mcp)](https://smithery.ai/server/@PinataCloud/pinata-mcp)
 
 A Model Context Protocol (MCP) server that provides Claude with access to Pinata. This integration allows Claude to interact with Public and Private IPFS through Pinata's API.
 
@@ -45,6 +46,14 @@ Add the following config to `claude_desktop_config.json`
     }
   }
 }
+```
+
+### Installing via Smithery
+
+To install Pinata MCP for Claude Desktop automatically via [Smithery](https://smithery.ai/server/@PinataCloud/pinata-mcp):
+
+```bash
+npx -y @smithery/cli install @PinataCloud/pinata-mcp --client claude
 ```
 
 ## Usage

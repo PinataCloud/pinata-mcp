@@ -1,0 +1,40 @@
+# Smithery configuration file: https://smithery.ai/docs/config#smitheryyaml
+
+startCommand:
+  type: stdio
+  configSchema:
+    # JSON Schema defining the configuration options for the MCP.
+    type: object
+    required:
+      - allowedDirectories
+      - pinataJwt
+      - gatewayUrl
+    properties:
+      allowedDirectories:
+        type: array
+        items:
+          type: string
+        description: Directories allowed for Pinata operations. Provide one or more
+          absolute paths that exist in the container.
+      pinataJwt:
+        type: string
+        description: Your Pinata JWT for authentication.
+      gatewayUrl:
+        type: string
+        description: The gateway URL to use for IPFS content retrieval.
+  commandFunction:
+    # A JS function that produces the CLI command based on the given config to start the MCP on stdio.
+    |-
+    (config) => ({
+      command: 'node',
+      args: ['dist/index.js', ...config.allowedDirectories],
+      env: {
+        PINATA_JWT: config.pinataJwt,
+        GATEWAY_URL: config.gatewayUrl
+      }
+    })
+  exampleConfig:
+    allowedDirectories:
+      - /home/user/pinata/files
+    pinataJwt: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.example
+    gatewayUrl: example.mypinata.cloud

@@ -1,3 +1,5 @@
+[![MseeP.ai Security Assessment Badge](https://mseep.net/pr/pinatacloud-pinata-mcp-badge.png)](https://mseep.ai/app/pinatacloud-pinata-mcp)
+
 # pinata-mcp
 
 A Model Context Protocol (MCP) server that provides Claude with access to Pinata. This integration allows Claude to interact with Public and Private IPFS through Pinata's API.

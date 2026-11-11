@@ -63,7 +63,7 @@ Add the following config to `claude_desktop_config.json`:
 
 | Tool | Description |
 |------|-------------|
-| `uploadFile` | Upload a file to Pinata (public or private IPFS) |
+| `uploadFile` | Upload a file to Pinata (public or private IPFS). Files over 90 MiB use resumable uploads; `waitForCid: false` returns once the bytes are stored, before Pinata registers the file |
 | `searchFiles` | Search files by name, CID, or MIME type |
 | `getFileById` | Get detailed file information by ID |
 | `updateFile` | Update file metadata (name, key-values) |

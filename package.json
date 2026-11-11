@@ -23,6 +23,7 @@
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.25.2",
+    "pinata": "^2.5.7",
     "zod": "^3.24.2"
   }
 }

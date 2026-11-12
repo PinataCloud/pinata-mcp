@@ -162,11 +162,11 @@ npm run build
 
 ### 3. Set up environment variables
 
-Create a `.env` file in the project root (optional, you can also pass these in the MCP config):
+The server reads `PINATA_JWT` and `GATEWAY_URL` from its environment; it does not load a `.env` file. Pass them in the MCP config (step 4), with `-e` for the MCP Inspector, or export them in your shell:
 
-```
-PINATA_JWT=your_pinata_jwt_here
-GATEWAY_URL=your-gateway.mypinata.cloud
+```bash
+export PINATA_JWT=your_pinata_jwt_here
+export GATEWAY_URL=your-gateway.mypinata.cloud
 ```
 
 ### 4. Configure Claude to use the local build

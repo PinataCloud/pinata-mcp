@@ -368,7 +368,7 @@ server.tool(
       .boolean()
       .optional()
       .describe(
-        "Files over 90 MiB only. By default the upload waits until Pinata has registered the file and returns its full record. Set to false to return once the bytes are stored: the result then holds only cid (empty if not known yet) and size, and registration can still fail."
+        "Files over 90 MiB only. By default the upload waits until Pinata has registered the file and returns its full record. Set to false to return once the bytes are stored: the result then holds only cid (empty if not known yet), size and network, and registration can still fail."
       ),
   },
   async ({ resourceUri, fileContent, fileName, mimeType, network, group_id, keyvalues, waitForCid }) => {

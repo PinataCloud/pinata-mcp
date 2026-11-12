@@ -244,6 +244,22 @@ npx @modelcontextprotocol/inspector --cli --method tools/call \
   -- node dist/index.js
 ```
 
+## Releasing
+
+Publishing a GitHub Release publishes the package to npm through the `Release` workflow (`.github/workflows/release.yml`).
+
+1. **Bump the version** in `package.json` (and `package-lock.json`) and push it to `main`: `npm version patch|minor|major --no-git-tag-version`.
+2. **Create a GitHub Release** with the tag `v<version>` (e.g. `v0.3.1`) on that commit. The workflow:
+   - checks that the tag matches `package.json` and that the version isn't on npm yet
+   - waits for approval of the `npm-publish` environment, which only `main` and `v*` tags can deploy to
+   - builds and publishes with [trusted publishing](https://docs.npmjs.com/trusted-publishers) and provenance (no npm token). Releases marked as pre-release go to the `next` dist-tag, everything else to `latest`.
+
+```bash
+npm version patch --no-git-tag-version
+git commit -am "chore: release 0.3.1" && git push
+gh release create v0.3.1 --generate-notes          # add --prerelease for a "next" release
+```
+
 ## Example Prompts for Claude
 
 ```

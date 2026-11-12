@@ -259,7 +259,7 @@ server.tool(
     id: z.string().describe("The unique ID of the file to update"),
     name: z.string().optional().describe("New name for the file"),
     keyvalues: z
-      .record(z.string(), z.any())
+      .record(z.string(), z.string())
       .optional()
       .describe("Metadata key-value pairs to update"),
   },
@@ -267,7 +267,7 @@ server.tool(
     try {
       const url = `https://api.pinata.cloud/v3/files/${network}/${id}`;
 
-      const payload: { name?: string; keyvalues?: Record<string, unknown> } =
+      const payload: { name?: string; keyvalues?: Record<string, string> } =
         {};
       if (name) payload.name = name;
       if (keyvalues) payload.keyvalues = keyvalues;

@@ -6,7 +6,7 @@ A Model Context Protocol (MCP) server that provides Claude with access to Pinata
 
 ### Prerequisites
 
-- Node.js 18+ installed
+- Node.js 20+ installed
 - A Pinata account with an API key (JWT)
 - A Pinata Gateway URL
 

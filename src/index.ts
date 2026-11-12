@@ -436,7 +436,7 @@ server.tool(
         content: [
           {
             type: "text",
-            text: `${heading}\n\n${JSON.stringify(data, null, 2)}`,
+            text: `${heading}\n\n${JSON.stringify({ data }, null, 2)}`,
           },
         ],
       };

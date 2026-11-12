@@ -12,12 +12,12 @@
     "build": "tsc && chmod 755 dist/index.js",
     "prepublishOnly": "npm run build"
   },
-  "files": [
-    "dist"
-  ],
   "engines": {
     "node": ">=20"
   },
+  "files": [
+    "dist"
+  ],
   "devDependencies": {
     "@types/node": "^25.0.9"
   },

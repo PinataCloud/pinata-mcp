@@ -3,11 +3,20 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 import fs from "fs/promises";
-import { openAsBlob } from "fs";
+import * as fsSync from "fs";
 import path from "path";
 import os from "os";
 import { ResourceTemplate } from "@modelcontextprotocol/sdk/server/mcp.js";
+import type { RequestHandlerExtra } from "@modelcontextprotocol/sdk/shared/protocol.js";
+import type { ServerNotification, ServerRequest } from "@modelcontextprotocol/sdk/types.js";
+import type { FileHandle } from "fs/promises";
 import { PinataSDK } from "pinata";
+
+// Uploads use the global File and fs.openAsBlob, which Node.js added in version 20.
+if (typeof File === "undefined" || typeof fsSync.openAsBlob !== "function") {
+  console.error(`pinata-mcp needs Node.js 20 or newer; this is Node.js ${process.version}`);
+  process.exit(1);
+}
 
 // Command line argument parsing for allowed directories
 const args = process.argv.slice(2);
@@ -34,6 +43,18 @@ function expandHome(filepath: string): string {
   return filepath;
 }
 
+// True when `child` is `parent` or inside it. Compares whole path segments, so
+// /data/allowed-other is not inside /data/allowed.
+function isWithin(child: string, parent: string): boolean {
+  const relative = path.relative(parent, child);
+  return (
+    relative === "" ||
+    (relative !== ".." &&
+      !relative.startsWith(".." + path.sep) &&
+      !path.isAbsolute(relative))
+  );
+}
+
 // Security: validate path is within allowed directories
 async function validatePath(requestedPath: string): Promise<string> {
   // If no directories specified, allow current working directory
@@ -41,53 +62,159 @@ async function validatePath(requestedPath: string): Promise<string> {
     allowedDirectories.length > 0
       ? allowedDirectories
       : [normalizePath(process.cwd())];
+  // Resolved targets are compared with resolved directories (on macOS, /tmp is a
+  // symlink to /private/tmp).
+  const realDirs = await Promise.all(
+    dirsToCheck.map((dir) => fs.realpath(dir).catch(() => dir))
+  );
 
   const expandedPath = expandHome(requestedPath);
-  const absolute = path.isAbsolute(expandedPath)
-    ? path.resolve(expandedPath)
-    : path.resolve(process.cwd(), expandedPath);
+  const absolute = normalizePath(path.resolve(process.cwd(), expandedPath));
 
-  const normalizedRequested = normalizePath(absolute);
-
-  const isAllowed = dirsToCheck.some((dir) =>
-    normalizedRequested.startsWith(dir)
-  );
-  if (!isAllowed) {
+  if (![...dirsToCheck, ...realDirs].some((dir) => isWithin(absolute, dir))) {
     throw new Error(
       `Access denied - path outside allowed directories: ${absolute}`
     );
   }
 
+  // Follow symlinks: the target, not the link, must be inside an allowed directory.
+  let realPath: string;
   try {
-    const realPath = await fs.realpath(absolute);
-    const normalizedReal = normalizePath(realPath);
-    const isRealPathAllowed = dirsToCheck.some((dir) =>
-      normalizedReal.startsWith(dir)
-    );
-    if (!isRealPathAllowed) {
+    realPath = await fs.realpath(absolute);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+      throw error;
+    }
+    // A link whose target is missing could later point anywhere
+    if (await fs.lstat(absolute).then(() => true, () => false)) {
       throw new Error(
-        "Access denied - symlink target outside allowed directories"
+        "Access denied - symlink target does not exist or is outside allowed directories"
       );
     }
-    return realPath;
-  } catch (error) {
+    // A path that does not exist yet: resolve its parent directory instead
     const parentDir = path.dirname(absolute);
+    let realParent: string;
     try {
-      const realParentPath = await fs.realpath(parentDir);
-      const normalizedParent = normalizePath(realParentPath);
-      const isParentAllowed = dirsToCheck.some((dir) =>
-        normalizedParent.startsWith(dir)
-      );
-      if (!isParentAllowed) {
-        throw new Error(
-          "Access denied - parent directory outside allowed directories"
-        );
-      }
-      return absolute;
+      realParent = await fs.realpath(parentDir);
     } catch {
       throw new Error(`Parent directory does not exist: ${parentDir}`);
     }
+    realPath = path.join(realParent, path.basename(absolute));
   }
+
+  if (!realDirs.some((dir) => isWithin(realPath, dir))) {
+    throw new Error(
+      "Access denied - symlink target outside allowed directories"
+    );
+  }
+  return realPath;
+}
+
+// Node's fs.openAsBlob() reports the size of a file of 4 GiB or more modulo 2^32, and
+// Blob.slice() past 2^32 aborts the process (nodejs/node#66207). Files that large are
+// read through DiskFile instead.
+const FOUR_GIB = 2 ** 32;
+const DISK_STREAM_PIECE = 8 * 1024 * 1024;
+
+// A File whose bytes stay on disk: its size comes from fs.stat, and slice() and
+// stream() read the file with fs. Only used for files of 4 GiB or more, which always
+// take the SDK's resumable path, and that path reads only size, name, type, slice()
+// and stream(). Its Blob contents are empty, so it must never reach FormData or
+// new Blob([...]).
+class DiskFile extends File {
+  readonly #path: string;
+  readonly #size: number;
+
+  constructor(filePath: string, size: number, name: string, type: string) {
+    super([], name, { type });
+    this.#path = filePath;
+    this.#size = size;
+  }
+
+  get size(): number {
+    return this.#size;
+  }
+
+  slice(start?: number, end?: number, contentType?: string): Blob {
+    const size = this.#size;
+    const clamp = (value: number) =>
+      value < 0 ? Math.max(size + value, 0) : Math.min(value, size);
+    const from = clamp(start ?? 0);
+    const to = Math.max(clamp(end ?? size), from);
+    const buffer = Buffer.alloc(to - from);
+    const fd = fsSync.openSync(this.#path, "r");
+    try {
+      let read = 0;
+      while (read < buffer.length) {
+        const bytes = fsSync.readSync(fd, buffer, read, buffer.length - read, from + read);
+        if (bytes === 0) {
+          throw new Error(`${this.#path} got shorter while it was being uploaded`);
+        }
+        read += bytes;
+      }
+    } finally {
+      fsSync.closeSync(fd);
+    }
+    return new Blob([buffer], { type: contentType ?? "" });
+  }
+
+  stream(): ReadableStream<Uint8Array<ArrayBuffer>> {
+    const filePath = this.#path;
+    const size = this.#size;
+    let handle: FileHandle | undefined;
+    let position = 0;
+    return new ReadableStream<Uint8Array<ArrayBuffer>>({
+      async pull(controller) {
+        handle ??= await fs.open(filePath, "r");
+        const length = Math.min(DISK_STREAM_PIECE, size - position);
+        if (length === 0) {
+          await handle.close();
+          controller.close();
+          return;
+        }
+        const buffer = new Uint8Array(length);
+        const { bytesRead } = await handle.read(buffer, 0, length, position);
+        if (bytesRead === 0) {
+          await handle.close();
+          controller.error(new Error(`${filePath} got shorter while it was being uploaded`));
+          return;
+        }
+        position += bytesRead;
+        controller.enqueue(buffer.subarray(0, bytesRead));
+      },
+      async cancel() {
+        await handle?.close();
+      },
+    });
+  }
+
+  // Reading the whole file into memory is what this class exists to avoid
+  async arrayBuffer(): Promise<ArrayBuffer> {
+    throw new Error("DiskFile is read with slice() or stream()");
+  }
+
+  async text(): Promise<string> {
+    throw new Error("DiskFile is read with slice() or stream()");
+  }
+}
+
+// Opens a file on disk for upload, with its real size whatever that size is.
+async function openFileForUpload(filePath: string, name: string, type: string): Promise<File> {
+  const stats = await fs.stat(filePath);
+  if (!stats.isFile()) {
+    throw new Error(`Not a file: ${filePath}`);
+  }
+  if (stats.size >= FOUR_GIB) {
+    return new DiskFile(filePath, stats.size, name, type);
+  }
+  // Backed by the file on disk: large uploads are read chunk by chunk.
+  const blob = await fsSync.openAsBlob(filePath, { type });
+  if (blob.size !== stats.size) {
+    throw new Error(
+      `${filePath} has ${stats.size} bytes but reads as ${blob.size}; refusing to upload part of it`
+    );
+  }
+  return new File([blob], name, { type });
 }
 
 const server = new McpServer({
@@ -334,7 +461,7 @@ server.tool(
 
 server.tool(
   "uploadFile",
-  "Upload a file to Pinata IPFS. Provide either a file:// URI or base64-encoded content. Files over 90 MiB are sent as resumable uploads.",
+  "Upload a file to Pinata IPFS. Provide either a file:// URI or base64-encoded content. Files over 90 MiB are sent as resumable uploads, and by default the call returns only once Pinata has registered the file, which for a large file can take several minutes per GiB after the last byte. Progress is reported every 15 seconds to clients that ask for it. If your client times out on long calls, pass waitForCid: false for large files and find the file later with searchFiles by name or CID.",
   {
     resourceUri: z
       .string()
@@ -371,7 +498,7 @@ server.tool(
         "Files over 90 MiB only. By default the upload waits until Pinata has registered the file and returns its full record. Set to false to return once the bytes are stored: the result then holds only cid (empty if not known yet), size and network, and registration can still fail."
       ),
   },
-  async ({ resourceUri, fileContent, fileName, mimeType, network, group_id, keyvalues, waitForCid }) => {
+  async ({ resourceUri, fileContent, fileName, mimeType, network, group_id, keyvalues, waitForCid }, extra) => {
     try {
       if (!PINATA_JWT) {
         throw new Error("PINATA_JWT environment variable is not set");
@@ -397,9 +524,7 @@ server.tool(
         // Validate path is allowed
         filePath = await validatePath(filePath);
         const name = fileName || path.basename(filePath);
-        // Backed by the file on disk: large uploads are read chunk by chunk.
-        const blob = await openAsBlob(filePath);
-        file = new File([blob], name, { type: mimeType || getMimeType(name) });
+        file = await openFileForUpload(filePath, name, mimeType || getMimeType(name));
       } else if (fileContent) {
         // Base64 content mode
         if (!fileName) {
@@ -427,7 +552,27 @@ server.tool(
         upload = upload.waitForCid(waitForCid);
       }
 
-      const data = await upload;
+      const stopProgress = startProgressHeartbeat(extra, file);
+      let data;
+      try {
+        data = await upload;
+      } catch (error) {
+        throw explainUploadError(error, file.size);
+      } finally {
+        stopProgress();
+      }
+      if (!data) {
+        // The bytes were accepted, but the follow-up lookup of the file came back empty
+        const known = { name: file.name, size: file.size, network };
+        return {
+          content: [
+            {
+              type: "text",
+              text: `✅ File uploaded, but Pinata did not return its record yet. Find it in a moment with searchFiles by name.\n\n${JSON.stringify(known, null, 2)}`,
+            },
+          ],
+        };
+      }
       // Only an upload that returned before registration lacks an id.
       const heading = data.id
         ? "✅ File uploaded successfully!"
@@ -445,6 +590,61 @@ server.tool(
     }
   }
 );
+
+// MCP clients often give up on a tool call after about 60 seconds, and a large upload
+// takes longer: after its last byte, Pinata can take several minutes per GiB to
+// register the file. When the client asked for progress (a progressToken), report
+// every 15 seconds that the upload is still running; clients can reset their timeout
+// on each report.
+const PROGRESS_INTERVAL_MS = 15_000;
+
+function startProgressHeartbeat(
+  extra: RequestHandlerExtra<ServerRequest, ServerNotification>,
+  file: File
+): () => void {
+  const progressToken = extra._meta?.progressToken;
+  if (progressToken === undefined) {
+    return () => {};
+  }
+  const started = Date.now();
+  const size = formatBytes(file.size);
+  const timer = setInterval(() => {
+    const seconds = Math.round((Date.now() - started) / 1000);
+    extra
+      .sendNotification({
+        method: "notifications/progress",
+        params: {
+          progressToken,
+          // Seconds elapsed: always increases, and there is no known total
+          progress: seconds,
+          message: `Uploading ${file.name} (${size}), ${seconds} s so far`,
+        },
+      })
+      .catch(() => {});
+  }, PROGRESS_INTERVAL_MS);
+  return () => clearInterval(timer);
+}
+
+// The SDK encodes resumable-upload metadata with btoa(), which throws for characters
+// outside Latin-1. Say which values are affected instead of "Invalid character".
+function explainUploadError(error: unknown, size: number): unknown {
+  if (
+    size > 90 * 1024 * 1024 &&
+    error instanceof Error &&
+    error.name === "InvalidCharacterError"
+  ) {
+    return new Error(
+      "Files over 90 MiB can't yet have a fileName, keyvalues or group_id with characters outside Latin-1 (for example 東京). Use plain ASCII for those values."
+    );
+  }
+  return error;
+}
+
+function formatBytes(bytes: number): string {
+  if (bytes >= 1024 ** 3) return `${(bytes / 1024 ** 3).toFixed(1)} GiB`;
+  if (bytes >= 1024 ** 2) return `${(bytes / 1024 ** 2).toFixed(1)} MiB`;
+  return `${bytes} bytes`;
+}
 
 // ============================================================================
 // Private Download Links

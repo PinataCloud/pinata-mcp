@@ -6,7 +6,7 @@
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "bin": {
-    "pinata-mcp": "./dist/index.js"
+    "pinata-mcp": "dist/index.js"
   },
   "scripts": {
     "build": "tsc && chmod 755 dist/index.js",
@@ -28,5 +28,9 @@
     "@modelcontextprotocol/sdk": "^1.32.2",
     "pinata": "^2.5.8",
     "zod": "^4.6.7"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/PinataCloud/pinata-mcp.git"
   }
 }

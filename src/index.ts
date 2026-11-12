@@ -3,9 +3,11 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 import fs from "fs/promises";
+import { openAsBlob } from "fs";
 import path from "path";
 import os from "os";
 import { ResourceTemplate } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { PinataSDK } from "pinata";
 
 // Command line argument parsing for allowed directories
 const args = process.argv.slice(2);
@@ -332,7 +334,7 @@ server.tool(
 
 server.tool(
   "uploadFile",
-  "Upload a file to Pinata IPFS. Provide either a file:// URI or base64-encoded content.",
+  "Upload a file to Pinata IPFS. Provide either a file:// URI or base64-encoded content. Files over 90 MiB are sent as resumable uploads.",
   {
     resourceUri: z
       .string()
@@ -362,11 +364,20 @@ server.tool(
       .record(z.string())
       .optional()
       .describe("Metadata key-value pairs for the file"),
+    waitForCid: z
+      .boolean()
+      .optional()
+      .describe(
+        "Files over 90 MiB only. By default the upload waits until Pinata has registered the file and returns its full record. Set to false to return once the bytes are stored: the result then holds only cid (empty if not known yet) and size, and registration can still fail."
+      ),
   },
-  async ({ resourceUri, fileContent, fileName, mimeType, network, group_id, keyvalues }) => {
+  async ({ resourceUri, fileContent, fileName, mimeType, network, group_id, keyvalues, waitForCid }) => {
     try {
-      let fileBuffer: Buffer;
-      let finalFileName: string;
+      if (!PINATA_JWT) {
+        throw new Error("PINATA_JWT environment variable is not set");
+      }
+
+      let file: File;
 
       if (resourceUri) {
         // File path mode
@@ -385,55 +396,47 @@ server.tool(
 
         // Validate path is allowed
         filePath = await validatePath(filePath);
-        fileBuffer = await fs.readFile(filePath);
-        finalFileName = fileName || path.basename(filePath);
+        const name = fileName || path.basename(filePath);
+        // Backed by the file on disk: large uploads are read chunk by chunk.
+        const blob = await openAsBlob(filePath);
+        file = new File([blob], name, { type: mimeType || getMimeType(name) });
       } else if (fileContent) {
         // Base64 content mode
         if (!fileName) {
           throw new Error("fileName is required when using fileContent");
         }
-        fileBuffer = Buffer.from(fileContent, "base64");
-        finalFileName = fileName;
+        file = new File([Buffer.from(fileContent, "base64")], fileName, {
+          type: mimeType || getMimeType(fileName),
+        });
       } else {
         throw new Error("Either resourceUri or fileContent must be provided");
       }
 
-      const detectedMimeType = mimeType || getMimeType(finalFileName);
-
-      const formData = new FormData();
-      const blob = new Blob([new Uint8Array(fileBuffer)], { type: detectedMimeType });
-      formData.append("file", blob, finalFileName);
-      formData.append("network", network);
-
+      const pinata = new PinataSDK({ pinataJwt: PINATA_JWT });
+      let upload =
+        network === "public"
+          ? pinata.upload.public.file(file)
+          : pinata.upload.private.file(file);
       if (group_id) {
-        formData.append("group_id", group_id);
+        upload = upload.group(group_id);
       }
-
       if (keyvalues) {
-        formData.append("keyvalues", JSON.stringify(keyvalues));
+        upload = upload.keyvalues(keyvalues);
+      }
+      if (waitForCid !== undefined) {
+        upload = upload.waitForCid(waitForCid);
       }
 
-      const response = await fetch("https://uploads.pinata.cloud/v3/files", {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${PINATA_JWT}`,
-        },
-        body: formData,
-      });
-
-      if (!response.ok) {
-        const errorText = await response.text();
-        throw new Error(
-          `Failed to upload file: ${response.status} ${response.statusText}\n${errorText}`
-        );
-      }
-
-      const data = await response.json();
+      const data = await upload;
+      // Only an upload that returned before registration lacks an id.
+      const heading = data.id
+        ? "✅ File uploaded successfully!"
+        : "✅ File stored. Pinata is still registering it, so only its CID and size are known.";
       return {
         content: [
           {
             type: "text",
-            text: `✅ File uploaded successfully!\n\n${JSON.stringify(data, null, 2)}`,
+            text: `${heading}\n\n${JSON.stringify({ data }, null, 2)}`,
           },
         ],
       };

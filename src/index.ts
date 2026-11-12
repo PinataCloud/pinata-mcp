@@ -165,22 +165,26 @@ class DiskFile extends File {
     let position = 0;
     return new ReadableStream<Uint8Array<ArrayBuffer>>({
       async pull(controller) {
-        handle ??= await fs.open(filePath, "r");
-        const length = Math.min(DISK_STREAM_PIECE, size - position);
-        if (length === 0) {
-          await handle.close();
-          controller.close();
-          return;
+        try {
+          handle ??= await fs.open(filePath, "r");
+          const length = Math.min(DISK_STREAM_PIECE, size - position);
+          if (length === 0) {
+            await handle.close();
+            controller.close();
+            return;
+          }
+          const buffer = new Uint8Array(length);
+          const { bytesRead } = await handle.read(buffer, 0, length, position);
+          if (bytesRead === 0) {
+            throw new Error(`${filePath} got shorter while it was being uploaded`);
+          }
+          position += bytesRead;
+          controller.enqueue(buffer.subarray(0, bytesRead));
+        } catch (error) {
+          // A failed read ends the stream; don't leave the file open
+          await handle?.close().catch(() => {});
+          controller.error(error);
         }
-        const buffer = new Uint8Array(length);
-        const { bytesRead } = await handle.read(buffer, 0, length, position);
-        if (bytesRead === 0) {
-          await handle.close();
-          controller.error(new Error(`${filePath} got shorter while it was being uploaded`));
-          return;
-        }
-        position += bytesRead;
-        controller.enqueue(buffer.subarray(0, bytesRead));
       },
       async cancel() {
         await handle?.close();
@@ -194,6 +198,10 @@ class DiskFile extends File {
   }
 
   async text(): Promise<string> {
+    throw new Error("DiskFile is read with slice() or stream()");
+  }
+
+  async bytes(): Promise<Uint8Array<ArrayBuffer>> {
     throw new Error("DiskFile is read with slice() or stream()");
   }
 }
@@ -556,8 +564,6 @@ server.tool(
       let data;
       try {
         data = await upload;
-      } catch (error) {
-        throw explainUploadError(error, file.size);
       } finally {
         stopProgress();
       }
@@ -623,21 +629,6 @@ function startProgressHeartbeat(
       .catch(() => {});
   }, PROGRESS_INTERVAL_MS);
   return () => clearInterval(timer);
-}
-
-// The SDK encodes resumable-upload metadata with btoa(), which throws for characters
-// outside Latin-1. Say which values are affected instead of "Invalid character".
-function explainUploadError(error: unknown, size: number): unknown {
-  if (
-    size > 90 * 1024 * 1024 &&
-    error instanceof Error &&
-    error.name === "InvalidCharacterError"
-  ) {
-    return new Error(
-      "Files over 90 MiB can't yet have a fileName, keyvalues or group_id with characters outside Latin-1 (for example 東京). Use plain ASCII for those values."
-    );
-  }
-  return error;
 }
 
 function formatBytes(bytes: number): string {

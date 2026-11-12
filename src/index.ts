@@ -259,7 +259,7 @@ server.tool(
     id: z.string().describe("The unique ID of the file to update"),
     name: z.string().optional().describe("New name for the file"),
     keyvalues: z
-      .record(z.any())
+      .record(z.string(), z.any())
       .optional()
       .describe("Metadata key-value pairs to update"),
   },
@@ -361,7 +361,7 @@ server.tool(
       .optional()
       .describe("ID of a group to add the file to"),
     keyvalues: z
-      .record(z.string())
+      .record(z.string(), z.string())
       .optional()
       .describe("Metadata key-value pairs for the file"),
     waitForCid: z
@@ -1498,7 +1498,7 @@ server.tool(
       .optional()
       .describe("Name of the file that will be uploaded"),
     keyvalues: z
-      .record(z.string())
+      .record(z.string(), z.string())
       .optional()
       .describe("Metadata key-value pairs for the file"),
   },
@@ -1563,7 +1563,7 @@ server.tool(
     name: z.string().optional().describe("Custom name for the file"),
     group_id: z.string().optional().describe("ID of the group to add the file to"),
     keyvalues: z
-      .record(z.string())
+      .record(z.string(), z.string())
       .optional()
       .describe("Metadata key-value pairs for the file"),
     host_nodes: z

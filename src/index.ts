@@ -9,7 +9,7 @@ import os from "os";
 import { ResourceTemplate } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { RequestHandlerExtra } from "@modelcontextprotocol/sdk/shared/protocol.js";
 import type { ServerNotification, ServerRequest } from "@modelcontextprotocol/sdk/types.js";
-import type { FileHandle } from "fs/promises";
+import { promisify } from "util";
 import { PinataSDK } from "pinata";
 
 // Uploads use the global File and fs.openAsBlob, which Node.js added in version 20.
@@ -115,79 +115,102 @@ async function validatePath(requestedPath: string): Promise<string> {
 // read through DiskFile instead.
 const FOUR_GIB = 2 ** 32;
 const DISK_STREAM_PIECE = 8 * 1024 * 1024;
+const readAt = promisify(fsSync.read);
 
-// A File whose bytes stay on disk: its size comes from fs.stat, and slice() and
-// stream() read the file with fs. Only used for files of 4 GiB or more, which always
+// A File whose bytes stay on disk: the file is opened once, and slice() and stream()
+// read through that descriptor. Only used for files of 4 GiB or more, which always
 // take the SDK's resumable path, and that path reads only size, name, type, slice()
 // and stream(). Its Blob contents are empty, so it must never reach FormData or
-// new Blob([...]).
+// new Blob([...]). The owner must call close() once the upload has ended.
 class DiskFile extends File {
   readonly #path: string;
-  readonly #size: number;
+  readonly #fd: number;
+  readonly #stats: fsSync.Stats;
+  #closed = false;
 
-  constructor(filePath: string, size: number, name: string, type: string) {
+  constructor(filePath: string, fd: number, stats: fsSync.Stats, name: string, type: string) {
     super([], name, { type });
     this.#path = filePath;
-    this.#size = size;
+    this.#fd = fd;
+    this.#stats = stats;
   }
 
   get size(): number {
-    return this.#size;
+    return this.#stats.size;
+  }
+
+  close(): void {
+    if (!this.#closed) {
+      this.#closed = true;
+      fsSync.closeSync(this.#fd);
+    }
+  }
+
+  // Like fs.openAsBlob(), refuse a file that was modified or replaced since it was
+  // opened, so the upload never mixes old and new bytes.
+  #checkUnchanged(): void {
+    const now = fsSync.fstatSync(this.#fd);
+    const atPath = fsSync.statSync(this.#path, { throwIfNoEntry: false });
+    if (
+      now.size !== this.#stats.size ||
+      now.mtimeMs !== this.#stats.mtimeMs ||
+      atPath?.ino !== this.#stats.ino ||
+      atPath?.dev !== this.#stats.dev
+    ) {
+      throw new Error(`${this.#path} changed while it was being uploaded`);
+    }
+  }
+
+  #ensureOpen(): void {
+    if (this.#closed) {
+      throw new Error(`${this.#path} was read after the upload ended`);
+    }
   }
 
   slice(start?: number, end?: number, contentType?: string): Blob {
-    const size = this.#size;
+    this.#ensureOpen();
+    const size = this.#stats.size;
     const clamp = (value: number) =>
       value < 0 ? Math.max(size + value, 0) : Math.min(value, size);
     const from = clamp(start ?? 0);
     const to = Math.max(clamp(end ?? size), from);
-    const buffer = Buffer.alloc(to - from);
-    const fd = fsSync.openSync(this.#path, "r");
-    try {
-      let read = 0;
-      while (read < buffer.length) {
-        const bytes = fsSync.readSync(fd, buffer, read, buffer.length - read, from + read);
-        if (bytes === 0) {
-          throw new Error(`${this.#path} got shorter while it was being uploaded`);
-        }
-        read += bytes;
+    // Every byte is overwritten below, so skip zero-filling
+    const buffer = Buffer.allocUnsafe(to - from);
+    let read = 0;
+    while (read < buffer.length) {
+      const bytes = fsSync.readSync(this.#fd, buffer, read, buffer.length - read, from + read);
+      if (bytes === 0) {
+        throw new Error(`${this.#path} got shorter while it was being uploaded`);
       }
-    } finally {
-      fsSync.closeSync(fd);
+      read += bytes;
     }
+    this.#checkUnchanged();
     return new Blob([buffer], { type: contentType ?? "" });
   }
 
   stream(): ReadableStream<Uint8Array<ArrayBuffer>> {
-    const filePath = this.#path;
-    const size = this.#size;
-    let handle: FileHandle | undefined;
+    const size = this.#stats.size;
     let position = 0;
     return new ReadableStream<Uint8Array<ArrayBuffer>>({
-      async pull(controller) {
+      pull: async (controller) => {
         try {
-          handle ??= await fs.open(filePath, "r");
+          this.#ensureOpen();
           const length = Math.min(DISK_STREAM_PIECE, size - position);
           if (length === 0) {
-            await handle.close();
             controller.close();
             return;
           }
-          const buffer = new Uint8Array(length);
-          const { bytesRead } = await handle.read(buffer, 0, length, position);
+          const buffer = Buffer.allocUnsafe(length);
+          const { bytesRead } = await readAt(this.#fd, buffer, 0, length, position);
           if (bytesRead === 0) {
-            throw new Error(`${filePath} got shorter while it was being uploaded`);
+            throw new Error(`${this.#path} got shorter while it was being uploaded`);
           }
+          this.#checkUnchanged();
           position += bytesRead;
-          controller.enqueue(buffer.subarray(0, bytesRead));
+          controller.enqueue(new Uint8Array(buffer.buffer, buffer.byteOffset, bytesRead));
         } catch (error) {
-          // A failed read ends the stream; don't leave the file open
-          await handle?.close().catch(() => {});
           controller.error(error);
         }
-      },
-      async cancel() {
-        await handle?.close();
       },
     });
   }
@@ -206,14 +229,26 @@ class DiskFile extends File {
   }
 }
 
-// Opens a file on disk for upload, with its real size whatever that size is.
+// Opens a file on disk for upload, with its real size whatever that size is. A
+// returned DiskFile holds the file open until its close() is called.
 async function openFileForUpload(filePath: string, name: string, type: string): Promise<File> {
   const stats = await fs.stat(filePath);
   if (!stats.isFile()) {
     throw new Error(`Not a file: ${filePath}`);
   }
   if (stats.size >= FOUR_GIB) {
-    return new DiskFile(filePath, stats.size, name, type);
+    // Size and mtime come from the descriptor that every read goes through
+    const fd = fsSync.openSync(filePath, "r");
+    try {
+      const opened = fsSync.fstatSync(fd);
+      if (!opened.isFile()) {
+        throw new Error(`Not a file: ${filePath}`);
+      }
+      return new DiskFile(filePath, fd, opened, name, type);
+    } catch (error) {
+      fsSync.closeSync(fd);
+      throw error;
+    }
   }
   // Backed by the file on disk: large uploads are read chunk by chunk.
   const blob = await fsSync.openAsBlob(filePath, { type });
@@ -507,12 +542,11 @@ server.tool(
       ),
   },
   async ({ resourceUri, fileContent, fileName, mimeType, network, group_id, keyvalues, waitForCid }, extra) => {
+    let file: File | undefined;
     try {
       if (!PINATA_JWT) {
         throw new Error("PINATA_JWT environment variable is not set");
       }
-
-      let file: File;
 
       if (resourceUri) {
         // File path mode
@@ -593,6 +627,11 @@ server.tool(
       };
     } catch (error) {
       return errorResponse(error);
+    } finally {
+      // A file of 4 GiB or more stays open for the upload; close it however it ended
+      if (file instanceof DiskFile) {
+        file.close();
+      }
     }
   }
 );

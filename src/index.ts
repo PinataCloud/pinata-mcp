@@ -10,7 +10,8 @@ import { ResourceTemplate } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { RequestHandlerExtra } from "@modelcontextprotocol/sdk/shared/protocol.js";
 import type { ServerNotification, ServerRequest } from "@modelcontextprotocol/sdk/types.js";
 import { promisify } from "util";
-import { PinataSDK } from "pinata";
+import { FolderUploadError, PinataSDK } from "pinata";
+import type { FolderEntry, FolderUploadEvent, FolderUploadOptions } from "pinata";
 
 // Uploads use the global File and fs.openAsBlob, which Node.js added in version 20.
 if (typeof File === "undefined" || typeof fsSync.openAsBlob !== "function") {
@@ -258,6 +259,14 @@ async function openFileForUpload(filePath: string, name: string, type: string): 
     );
   }
   return new File([blob], name, { type });
+}
+
+// The local path of a file:// URI
+function fileUriToPath(uri: string): string {
+  if (process.platform === "win32") {
+    return decodeURIComponent(uri.replace(/^file:\/\/\//, "").replace(/\//g, "\\"));
+  }
+  return decodeURIComponent(uri.replace(/^file:\/\//, ""));
 }
 
 const server = new McpServer({
@@ -554,14 +563,7 @@ server.tool(
           throw new Error("resourceUri must be a file:// URI");
         }
 
-        let filePath: string;
-        if (process.platform === "win32") {
-          filePath = decodeURIComponent(
-            resourceUri.replace(/^file:\/\/\//, "").replace(/\//g, "\\")
-          );
-        } else {
-          filePath = decodeURIComponent(resourceUri.replace(/^file:\/\//, ""));
-        }
+        let filePath = fileUriToPath(resourceUri);
 
         // Validate path is allowed
         filePath = await validatePath(filePath);
@@ -675,6 +677,431 @@ function formatBytes(bytes: number): string {
   if (bytes >= 1024 ** 2) return `${(bytes / 1024 ** 2).toFixed(1)} MiB`;
   return `${bytes} bytes`;
 }
+
+// ============================================================================
+// Folders
+// ============================================================================
+
+// How many failed or skipped files a result lists by name
+const LISTED_FILES_MAX = 50;
+
+interface FolderFile {
+  // Path inside the directory, with "/" separators
+  relativePath: string;
+  // Where the bytes are read: the file itself, or the target of a symlink to it
+  realPath: string;
+  size: number;
+}
+
+interface SkippedEntry {
+  path: string;
+  reason: string;
+}
+
+// The regular files under `root`, a real path inside the allowed directories, sorted by
+// path. A symlink to a file is followed when validatePath accepts its target; a symlink
+// to a directory is not followed (it could loop, or upload files twice). Whatever is not
+// uploaded is reported in `skipped`, empty directories included: a folder holds files.
+async function walkFolder(root: string): Promise<{ files: FolderFile[]; skipped: SkippedEntry[] }> {
+  const files: FolderFile[] = [];
+  const skipped: SkippedEntry[] = [];
+  const visit = async (dir: string, relative: string): Promise<void> => {
+    let entries: fsSync.Dirent[];
+    try {
+      entries = await fs.readdir(dir, { withFileTypes: true });
+    } catch (error) {
+      skipped.push({ path: `${relative || "."}/`, reason: `directory not readable: ${errorMessage(error)}` });
+      return;
+    }
+    if (entries.length === 0 && relative) {
+      skipped.push({ path: `${relative}/`, reason: "empty directory (a folder holds files only)" });
+      return;
+    }
+    entries.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+    for (const entry of entries) {
+      const fullPath = path.join(dir, entry.name);
+      const relativePath = relative ? `${relative}/${entry.name}` : entry.name;
+      // The SDK reads "\" in a path as a separator, and refuses "%" in paths
+      if (path.sep === "/" && entry.name.includes("\\")) {
+        skipped.push({ path: relativePath, reason: 'name contains "\\", which folder paths cannot hold' });
+        continue;
+      }
+      if (entry.name.includes("%")) {
+        skipped.push({ path: relativePath, reason: 'name contains "%", which folder paths cannot hold yet' });
+        continue;
+      }
+      if (entry.isDirectory()) {
+        await visit(fullPath, relativePath);
+      } else if (entry.isFile()) {
+        const stats = await fs.stat(fullPath);
+        files.push({ relativePath, realPath: fullPath, size: stats.size });
+      } else if (entry.isSymbolicLink()) {
+        let target: string;
+        try {
+          target = await validatePath(fullPath);
+        } catch (error) {
+          skipped.push({ path: relativePath, reason: `symlink: ${errorMessage(error)}` });
+          continue;
+        }
+        const stats = await fs.stat(target).catch(() => undefined);
+        if (stats?.isFile()) {
+          files.push({ relativePath, realPath: target, size: stats.size });
+        } else {
+          skipped.push({
+            path: relativePath,
+            reason: stats?.isDirectory()
+              ? "symlink to a directory (not followed)"
+              : "symlink to something other than a regular file",
+          });
+        }
+      } else {
+        skipped.push({ path: relativePath, reason: "not a regular file" });
+      }
+    }
+  };
+  await visit(root, "");
+  return { files, skipped };
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+// At most LISTED_FILES_MAX items, and how many more there are
+function capList<T>(items: T[]): { listed: T[]; more?: number } {
+  return items.length > LISTED_FILES_MAX
+    ? { listed: items.slice(0, LISTED_FILES_MAX), more: items.length - LISTED_FILES_MAX }
+    : { listed: items };
+}
+
+// Reports a folder upload's progress to a client that asked for it (a progressToken):
+// a notification for every file event, and one every 15 seconds while nothing else
+// happens (a large file's registration, the final sync). `total` is the file count plus
+// one, the last step being the final sync that gives the folder its CID; `progress`
+// counts the files done (uploaded or failed for good). The protocol wants each
+// notification's progress higher than the last, so the k-th notification since the
+// count last changed adds k/(k+1): always higher, never reaching the next file.
+function startFolderProgress(
+  extra: RequestHandlerExtra<ServerRequest, ServerNotification>,
+  fileCount: number,
+  relativePath: (index: number) => string
+): { onProgress?: (event: FolderUploadEvent) => void; stop: () => void } {
+  const progressToken = extra._meta?.progressToken;
+  if (progressToken === undefined) {
+    return { stop: () => {} };
+  }
+  const started = Date.now();
+  let done = 0;
+  let sinceDone = 0;
+  const send = (message: string) => {
+    const progress = done + sinceDone / (sinceDone + 1);
+    sinceDone++;
+    extra
+      .sendNotification({
+        method: "notifications/progress",
+        params: { progressToken, progress, total: fileCount + 1, message },
+      })
+      .catch(() => {});
+  };
+  const onProgress = (event: FolderUploadEvent) => {
+    const finished = event.completed + event.failed;
+    if (finished > done) {
+      done = finished;
+      sinceDone = 0;
+    }
+    send(`${finished}/${fileCount} files done: ${describeFolderEvent(event, relativePath(event.index))}`);
+  };
+  const timer = setInterval(() => {
+    const seconds = Math.round((Date.now() - started) / 1000);
+    const stage = done < fileCount ? "uploading" : "finishing the folder";
+    send(`${done}/${fileCount} files done, ${stage}, ${seconds} s so far`);
+  }, PROGRESS_INTERVAL_MS);
+  return { onProgress, stop: () => clearInterval(timer) };
+}
+
+function describeFolderEvent(event: FolderUploadEvent, filePath: string): string {
+  switch (event.type) {
+    case "start":
+      return `sending ${filePath}${event.attempt > 1 ? ` (attempt ${event.attempt})` : ""}`;
+    case "sent":
+      return `${filePath} sent, Pinata is registering it`;
+    case "complete":
+      return `uploaded ${filePath}`;
+    case "retry": {
+      const wait = event.waitingForPreviousUpload
+        ? "waiting for an earlier upload of the same path to finish"
+        : errorMessage(event.error);
+      return `retrying ${filePath} in ${Math.round((event.delayMs ?? 0) / 1000)} s: ${wait}`;
+    }
+    case "error":
+      return `failed ${filePath}: ${errorMessage(event.error)}`;
+  }
+}
+
+server.tool(
+  "uploadFolder",
+  "Upload a local directory to Pinata IPFS as one folder with one CID, keeping its subdirectories. Use this instead of uploadFile when the content is a directory (a website, a dataset, a set of images); use uploadFile for a single file. Every regular file under the directory is sent as its own resumable upload, several at a time, each retried on its own, so a large folder or a flaky connection does not restart from zero. Symlinks are followed only to files inside the allowed directories; skipped entries are listed in the result. When some files fail, the result names them and gives the arguments that send only those files again into the same folder (folderId + paths). Also adds files to an existing folder: pass its folderId and its name (listFolder shows it as root). Progress is reported per file to clients that ask for it.",
+  {
+    directory: z
+      .string()
+      .describe("Path of the local directory to upload (or its file:// URI); must be inside the allowed directories"),
+    network: z
+      .enum(["public", "private"])
+      .default("public")
+      .describe("Whether to upload to public or private IPFS"),
+    name: z
+      .string()
+      .optional()
+      .describe("Name of the folder on Pinata; the top directory of every file path in it. Defaults to the directory's name. When adding files to an existing folder, pass that folder's name."),
+    group_id: z
+      .string()
+      .optional()
+      .describe("ID of a group to add the folder to"),
+    keyvalues: z
+      .record(z.string(), z.string())
+      .optional()
+      .describe("Metadata key-value pairs for the folder"),
+    cidVersion: z
+      .enum(["v0", "v1"])
+      .optional()
+      .describe("CID version of the folder and its files (default v1)"),
+    concurrency: z
+      .number()
+      .int()
+      .min(1)
+      .max(32)
+      .optional()
+      .describe("How many files send their bytes at the same time (default 4)"),
+    folderId: z
+      .string()
+      .uuid()
+      .optional()
+      .describe("ID of an existing folder to upload into, instead of a new one: to send failed files again, or to add files. A file whose path is already in the folder replaces it."),
+    paths: z
+      .array(z.string())
+      .min(1)
+      .optional()
+      .describe("Upload only these files: paths relative to the directory, with / separators (e.g. the failed paths of an earlier call). Defaults to every file."),
+  },
+  async (
+    { directory, network, name, group_id, keyvalues, cidVersion, concurrency, folderId, paths },
+    extra
+  ) => {
+    const opened: File[] = [];
+    try {
+      if (!PINATA_JWT) {
+        throw new Error("PINATA_JWT environment variable is not set");
+      }
+      const root = await validatePath(
+        directory.startsWith("file://") ? fileUriToPath(directory) : directory
+      );
+      if (!(await fs.stat(root)).isDirectory()) {
+        throw new Error(`Not a directory: ${root}`);
+      }
+      const folderName = name || path.basename(root);
+      if (!folderName) {
+        throw new Error("name is required for this directory");
+      }
+
+      const walk = await walkFolder(root);
+      if (walk.files.length === 0) {
+        const skipped = capList(walk.skipped);
+        throw new Error(
+          `No files to upload in ${root}` +
+            (walk.skipped.length > 0
+              ? `; skipped:\n${JSON.stringify(skipped.listed, null, 2)}${skipped.more ? `\nand ${skipped.more} more` : ""}`
+              : "")
+        );
+      }
+      let files = walk.files;
+      if (paths) {
+        const byPath = new Map(files.map((file) => [file.relativePath, file]));
+        const wanted = [...new Set(paths.map((p) => p.replace(/\\/g, "/").replace(/^(\.?\/)+/, "")))];
+        const unknown = wanted.filter((p) => !byPath.has(p));
+        if (unknown.length > 0) {
+          const listed = capList(unknown);
+          throw new Error(
+            `Not files of ${root} that can be uploaded: ${listed.listed.join(", ")}${listed.more ? ` and ${listed.more} more` : ""}`
+          );
+        }
+        files = wanted.map((p) => byPath.get(p)!);
+      }
+
+      // Every path starts with the folder name, so the SDK keeps the paths as they are
+      const entries: FolderEntry[] = [];
+      for (const file of files) {
+        const fileName = path.posix.basename(file.relativePath);
+        const opening = await openFileForUpload(file.realPath, fileName, getMimeType(fileName));
+        opened.push(opening);
+        entries.push({ path: `${folderName}/${file.relativePath}`, file: opening });
+      }
+      const totalBytes = files.reduce((sum, file) => sum + file.size, 0);
+
+      const progress = startFolderProgress(extra, files.length, (index) => files[index].relativePath);
+      // The 15 s keep-alive and the per-file notifications both come from startFolderProgress
+      const options: FolderUploadOptions = {
+        metadata: { name: folderName, ...(keyvalues ? { keyvalues } : {}) },
+        ...(group_id ? { groupId: group_id } : {}),
+        ...(cidVersion ? { cid_version: cidVersion } : {}),
+        ...(concurrency ? { concurrency } : {}),
+        ...(folderId ? { folderId } : {}),
+        onProgress: progress.onProgress,
+        signal: extra.signal,
+      };
+      const started = Date.now();
+      const pinata = new PinataSDK({ pinataJwt: PINATA_JWT });
+      const skipped = capList(walk.skipped);
+      const skippedReport = walk.skipped.length > 0
+        ? { skipped: skipped.listed, ...(skipped.more ? { skipped_more: skipped.more } : {}) }
+        : {};
+      try {
+        const folder = await pinata.upload[network].folder(entries, options);
+        const heading = folder.is_duplicate
+          ? "✅ Folder uploaded. Its content matches a folder uploaded earlier, which Pinata kept instead: the id, name and CID below are that folder's."
+          : "✅ Folder uploaded successfully!";
+        const summary = {
+          id: folder.id,
+          name: folder.name,
+          cid: folder.cid,
+          network,
+          files_uploaded: files.length,
+          files_in_folder: folder.number_of_files,
+          total_bytes: totalBytes,
+          total_size: formatBytes(totalBytes),
+          duration_seconds: Math.round((Date.now() - started) / 100) / 10,
+          group_id: folder.group_id,
+          keyvalues: folder.keyvalues,
+          ...(folder.is_duplicate ? { is_duplicate: true } : {}),
+          ...skippedReport,
+        };
+        return {
+          content: [{ type: "text", text: `${heading}\n\n${JSON.stringify(summary, null, 2)}` }],
+        };
+      } catch (error) {
+        if (!(error instanceof FolderUploadError)) {
+          throw error;
+        }
+        const failed = error.failed.map((f) => ({
+          path: files[f.index].relativePath,
+          reason: errorMessage(f.error),
+        }));
+        const failedList = capList(failed);
+        // The arguments of a call that sends the failed files again into the same folder
+        const retry = {
+          directory: root,
+          network,
+          name: folderName,
+          folderId: error.folderId,
+          ...(group_id ? { group_id } : {}),
+          ...(keyvalues ? { keyvalues } : {}),
+          ...(cidVersion ? { cidVersion } : {}),
+          ...(failed.length <= LISTED_FILES_MAX
+            ? { paths: failed.map((f) => f.path) }
+            : paths
+              ? { paths }
+              : {}),
+        };
+        let next: string;
+        if (error.folder?.is_duplicate) {
+          next = "The files uploaded match a folder uploaded earlier, which Pinata kept instead of this one. Call uploadFolder again without folderId to upload every file into a new folder.";
+        } else if (failed.length === 0) {
+          next = `Every file was uploaded, but Pinata is still finishing the folder. Check it in a few minutes with listFolder (folderId ${error.folderId}).`;
+        } else if (failed.length <= LISTED_FILES_MAX) {
+          next = "To send only the failed files again into the same folder, call uploadFolder with these arguments:";
+        } else {
+          next = "Too many files failed to list them all. To send the files again into the same folder, call uploadFolder with these arguments (files already in the folder are replaced):";
+        }
+        const report = {
+          folderId: error.folderId,
+          name: folderName,
+          network,
+          files: files.length,
+          uploaded: error.uploaded.length,
+          failed: failed.length,
+          ...(error.folder ? { folder: error.folder } : {}),
+          duration_seconds: Math.round((Date.now() - started) / 100) / 10,
+          failed_files: failedList.listed,
+          ...(failedList.more ? { failed_more: `and ${failedList.more} more` } : {}),
+          ...skippedReport,
+        };
+        const showRetry = !error.folder?.is_duplicate && failed.length > 0;
+        return {
+          content: [
+            {
+              type: "text",
+              text:
+                `⚠️ Folder upload incomplete: ${error.message}\n\n${JSON.stringify(report, null, 2)}\n\n${next}` +
+                (showRetry ? `\n${JSON.stringify(retry, null, 2)}` : ""),
+            },
+          ],
+          isError: true,
+        };
+      } finally {
+        progress.stop();
+      }
+    } catch (error) {
+      return errorResponse(error);
+    } finally {
+      // Files of 4 GiB or more stay open for the upload; close them however it ended
+      for (const file of opened) {
+        if (file instanceof DiskFile) {
+          file.close();
+        }
+      }
+    }
+  }
+);
+
+server.tool(
+  "listFolder",
+  "List one level of a folder on Pinata (one uploaded with uploadFolder, or any other folder): its files and subdirectories with their names, paths, sizes and CIDs, plus the folder's CID, its root (the name every file path starts with) and whether files can still be added to it (appendable, appendable_until). Pass path to list a subdirectory, and next_page_token as pageToken for the next page.",
+  {
+    folderId: z.string().uuid().describe("ID of the folder (the id returned by uploadFolder)"),
+    network: z
+      .enum(["public", "private"])
+      .optional()
+      .describe("Network the folder is on; when given, a folder on the other network is not found"),
+    path: z
+      .string()
+      .optional()
+      .describe("Subdirectory to list, relative to the folder root, without the root name (e.g. images/2024). Defaults to the root."),
+    limit: z
+      .number()
+      .int()
+      .min(1)
+      .max(1000)
+      .optional()
+      .describe("Maximum number of entries to return (default 100, at most 1000)"),
+    pageToken: z.string().optional().describe("next_page_token of the previous page"),
+  },
+  async ({ folderId, network, path: subPath, limit, pageToken }) => {
+    try {
+      const params = new URLSearchParams();
+      if (network) params.append("network", network);
+      if (subPath) params.append("path", subPath.replace(/^\/+|\/+$/g, ""));
+      if (limit) params.append("limit", limit.toString());
+      if (pageToken) params.append("pageToken", pageToken);
+
+      const url = `https://uploads.pinata.cloud/v3/metadata/${folderId}/entries?${params.toString()}`;
+      const response = await fetch(url, {
+        method: "GET",
+        headers: getHeaders(),
+      });
+
+      if (!response.ok) {
+        const body = (await response.text().catch(() => "")).slice(0, 500);
+        throw new Error(
+          `Failed to list folder: ${response.status} ${response.statusText}${body ? `: ${body}` : ""}`
+        );
+      }
+
+      const { data } = await response.json();
+      return successResponse(data);
+    } catch (error) {
+      return errorResponse(error);
+    }
+  }
+);
 
 // ============================================================================
 // Private Download Links

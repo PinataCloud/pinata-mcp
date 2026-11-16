@@ -684,6 +684,9 @@ function formatBytes(bytes: number): string {
 
 // How many failed or skipped files a result lists by name
 const LISTED_FILES_MAX = 50;
+// How many failed paths the retry arguments of a partly failed upload carry. Above this,
+// they resend the whole directory into the folder instead.
+const RETRY_PATHS_MAX = 1000;
 
 interface FolderFile {
   // Path inside the directory, with "/" separators
@@ -995,7 +998,7 @@ server.tool(
           ...(group_id ? { group_id } : {}),
           ...(keyvalues ? { keyvalues } : {}),
           ...(cidVersion ? { cidVersion } : {}),
-          ...(failed.length <= LISTED_FILES_MAX
+          ...(failed.length <= RETRY_PATHS_MAX
             ? { paths: failed.map((f) => f.path) }
             : paths
               ? { paths }
@@ -1006,10 +1009,10 @@ server.tool(
           next = "The files uploaded match a folder uploaded earlier, which Pinata kept instead of this one. Call uploadFolder again without folderId to upload every file into a new folder.";
         } else if (failed.length === 0) {
           next = `Every file was uploaded, but Pinata is still finishing the folder. Check it in a few minutes with listFolder (folderId ${error.folderId}).`;
-        } else if (failed.length <= LISTED_FILES_MAX) {
+        } else if (failed.length <= RETRY_PATHS_MAX) {
           next = "To send only the failed files again into the same folder, call uploadFolder with these arguments:";
         } else {
-          next = "Too many files failed to list them all. To send the files again into the same folder, call uploadFolder with these arguments (files already in the folder are replaced):";
+          next = "Too many files failed to name them all. To send the files again into the same folder, call uploadFolder with these arguments (files already in the folder are replaced):";
         }
         const report = {
           folderId: error.folderId,

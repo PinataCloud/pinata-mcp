@@ -6,7 +6,7 @@ A Model Context Protocol (MCP) server that provides Claude with access to Pinata
 
 ### Prerequisites
 
-- Node.js 20+ installed
+- Node.js 20+ installed (uploads use `File` and `fs.openAsBlob`, which Node.js 18 lacks)
 - A Pinata account with an API key (JWT)
 - A Pinata Gateway URL
 
@@ -63,7 +63,7 @@ Add the following config to `claude_desktop_config.json`:
 
 | Tool | Description |
 |------|-------------|
-| `uploadFile` | Upload a file to Pinata (public or private IPFS). Files over 90 MiB use resumable uploads; `waitForCid: false` returns once the bytes are stored, before Pinata registers the file |
+| `uploadFile` | Upload a file to Pinata (public or private IPFS). Files over 90 MiB use resumable uploads and can be any size. A large upload returns once Pinata has registered the file, which can take several minutes per GiB; the server reports progress every 15 seconds to clients that ask for it. If your client times out first, pass `waitForCid: false` to return once the bytes are stored, then find the file with `searchFiles` |
 | `searchFiles` | Search files by name, CID, or MIME type |
 | `getFileById` | Get detailed file information by ID |
 | `updateFile` | Update file metadata (name, key-values) |

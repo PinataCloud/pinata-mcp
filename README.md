@@ -69,6 +69,53 @@ Add the following config to `claude_desktop_config.json`:
 | `updateFile` | Update file metadata (name, key-values) |
 | `deleteFile` | Delete a file from Pinata |
 
+### Folder Operations
+
+| Tool | Description |
+|------|-------------|
+| `uploadFolder` | Upload a local directory as one folder with one CID, subdirectories included. Use it instead of `uploadFile` whenever the content is a directory (a website, a dataset, a set of images). Each file is its own resumable upload, several at a time (`concurrency`, default 4), each retried on its own. Accepts `network`, `name` (defaults to the directory's name), `group_id`, `keyvalues`, `cidVersion`, `folderId` (upload into an existing folder) and `paths` (only these files, relative to the directory). Reports progress per file to clients that ask for it |
+| `listFolder` | List one level of a folder: files and subdirectories with names, paths, sizes and CIDs, the folder's CID and root name, and whether files can still be added (`appendable`, `appendable_until`). Accepts `path` for a subdirectory, `limit` and `pageToken` |
+
+`uploadFolder` uploads every regular file under the directory, hidden files and empty files included. Paths in the folder are relative to the directory, so the folder's CID is the one `ipfs add -r --cid-version 1 --raw-leaves <directory>` computes (as long as the directory holds no empty subdirectories or symlinks, which a folder doesn't keep). A symlink to a file is followed only when its target is inside the allowed directories; symlinks to directories, symlinks leaving the allowed directories, empty directories, and names holding `%` are skipped and listed in the result. An empty directory, or a directory outside the allowed directories, is refused.
+
+A successful upload returns the folder's id, name, CID, file count, total size and duration:
+
+```json
+{
+  "id": "019a8b2c-4d5e-7f60-8a1b-2c3d4e5f6a7b",
+  "name": "site",
+  "cid": "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi",
+  "network": "public",
+  "files_uploaded": 25,
+  "files_in_folder": 25,
+  "total_bytes": 1831186,
+  "total_size": "1.7 MiB",
+  "duration_seconds": 35.9
+}
+```
+
+When some files fail for good, the other files stay in the folder and the result lists the failed paths with their reasons (the first 50), the folder id, and the arguments of a call that sends only the failed files again into the same folder:
+
+```json
+{
+  "directory": "/path/to/allowed/directory/site",
+  "network": "public",
+  "name": "site",
+  "folderId": "019a8b2c-4d5e-7f60-8a1b-2c3d4e5f6a7b",
+  "paths": ["images/large.bin", "docs/guide.pdf"]
+}
+```
+
+The same `folderId` adds files to an existing folder, as long as `name` is the folder's name (its `root` in `listFolder`) and the folder is still `appendable`; a file whose path is already in the folder replaces it. For example, to add `new/report.pdf` from the same directory: `{ "directory": "/path/to/allowed/directory/site", "folderId": "…", "paths": ["new/report.pdf"] }`.
+
+`listFolder` lists one level at a time:
+
+```json
+{ "folderId": "019a8b2c-4d5e-7f60-8a1b-2c3d4e5f6a7b", "path": "images/2024", "limit": 100 }
+```
+
+returns the folder's `cid`, `root`, `appendable`, `appendable_until`, `entries` (each with `type` `file` or `directory`, `name`, `path`, and for files `size`, `cid` and `mime_type`) and `next_page_token`, to pass as `pageToken` for the next page (null on the last).
+
 ### Content Access
 
 | Tool | Description |
@@ -274,6 +321,9 @@ Search for files:
 
 Create a group and add files:
 "Create a new group called 'Project Assets' on Pinata, then find all my JSON files and add them to this group"
+
+Upload a folder:
+"Upload the folder ~/projects/site to Pinata as a public folder named 'site', then list its images directory"
 
 Fetch content from IPFS:
 "Fetch the content with CID QmX... from IPFS"

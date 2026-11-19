@@ -6,6 +6,7 @@ import fs from "fs/promises";
 import * as fsSync from "fs";
 import path from "path";
 import os from "os";
+import { createRequire } from "module";
 import { ResourceTemplate } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { RequestHandlerExtra } from "@modelcontextprotocol/sdk/shared/protocol.js";
 import type { ServerNotification, ServerRequest } from "@modelcontextprotocol/sdk/types.js";
@@ -269,9 +270,12 @@ function fileUriToPath(uri: string): string {
   return decodeURIComponent(uri.replace(/^file:\/\//, ""));
 }
 
+// The version clients see is this package's (dist/index.js reads ../package.json)
+const { version } = createRequire(import.meta.url)("../package.json") as { version: string };
+
 const server = new McpServer({
   name: "Pinata",
-  version: "0.2.0",
+  version,
 });
 
 const PINATA_JWT = process.env.PINATA_JWT;

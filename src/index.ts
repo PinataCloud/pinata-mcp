@@ -512,6 +512,27 @@ server.tool(
 );
 
 server.tool(
+  "getUploadLimits",
+  "Get the upload limits of your Pinata account: folder_max_files, the most files one folder can hold (30,000 unless the account has its own limit). Check it before uploadFolder on a large directory: a directory with more files must be uploaded as several folders.",
+  {},
+  async () => {
+    try {
+      const response = await fetch("https://uploads.pinata.cloud/v3/files/limits", {
+        method: "GET",
+        headers: getHeaders(),
+      });
+      if (!response.ok) {
+        throw new Error(`Failed to get upload limits: ${response.status} ${await response.text()}`);
+      }
+      const { data } = await response.json();
+      return successResponse(data);
+    } catch (error) {
+      return errorResponse(error);
+    }
+  }
+);
+
+server.tool(
   "uploadFile",
   "Upload a file to Pinata IPFS. Provide either a file:// URI or base64-encoded content. Files over 90 MiB are sent as resumable uploads, and by default the call returns only once Pinata has registered the file, which for a large file can take several minutes per GiB after the last byte. Progress is reported every 15 seconds to clients that ask for it. If your client times out on long calls, pass waitForCid: false for large files and find the file later with searchFiles by name or CID.",
   {
@@ -843,7 +864,7 @@ function describeFolderEvent(event: FolderUploadEvent, filePath: string): string
 
 server.tool(
   "uploadFolder",
-  "Upload a local directory to Pinata IPFS as one folder with one CID, keeping its subdirectories. Use this instead of uploadFile when the content is a directory (a website, a dataset, a set of images); use uploadFile for a single file. Every regular file under the directory is sent as its own resumable upload, several at a time, each retried on its own, so a large folder or a flaky connection does not restart from zero. Symlinks are followed only to files inside the allowed directories; skipped entries are listed in the result. When some files fail, the result names them and gives the arguments that send only those files again into the same folder (folderId + paths). Also adds files to an existing folder: pass its folderId and its name (listFolder shows it as root). Progress is reported per file to clients that ask for it.",
+  "Upload a local directory to Pinata IPFS as one folder with one CID, keeping its subdirectories. Use this instead of uploadFile when the content is a directory (a website, a dataset, a set of images); use uploadFile for a single file. Every regular file under the directory is sent as its own resumable upload, several at a time, each retried on its own, so a large folder or a flaky connection does not restart from zero. Symlinks are followed only to files inside the allowed directories; skipped entries are listed in the result. When some files fail, the result names them and gives the arguments that send only those files again into the same folder (folderId + paths). Also adds files to an existing folder: pass its folderId and its name (listFolder shows it as root). A folder holds at most folder_max_files files (see getUploadLimits; 30,000 unless the account has its own limit): upload a directory with more as several folders, one call per subset of its files, each with its own name and paths. Progress is reported per file to clients that ask for it.",
   {
     directory: z
       .string()

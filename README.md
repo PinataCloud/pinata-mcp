@@ -14,6 +14,8 @@ A Model Context Protocol (MCP) server that provides Claude with access to Pinata
 
 Installation will depend on whether you are using Claude Code or Claude Desktop.
 
+The server is also published as [`@pinata/mcp`](https://www.npmjs.com/package/@pinata/mcp), an alias of `pinata-mcp`: `npx @pinata/mcp` runs the same server, and either name works in the configs below.
+
 **Claude Code**
 
 Run `claude mcp add` and follow the prompts with the following information:
@@ -309,6 +311,12 @@ npm version patch --no-git-tag-version
 git commit -am "chore: release 0.3.1" && git push
 gh release create v0.3.1 --generate-notes          # add --prerelease for a "next" release
 ```
+
+### The `@pinata/mcp` alias
+
+`@pinata/mcp` in `packages/mcp-alias` is a thin alias whose `pinata-mcp` command runs this package's server (see its [README](packages/mcp-alias/README.md)). It depends on `pinata-mcp` with `>=0.5.0 <1.0.0`, so new 0.x releases reach it without republishing. It only needs a release when the alias itself changes or `pinata-mcp` reaches 1.0.
+
+To release it, bump `version` in `packages/mcp-alias/package.json` and push to `main`. `.github/workflows/publish-mcp-alias.yml` runs its test and publishes with trusted publishing, after approval of the `npm-publish` environment. The dist-tag comes from `publishConfig.tag` in that file.
 
 ## Example Prompts for Claude
 

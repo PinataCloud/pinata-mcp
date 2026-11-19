@@ -79,7 +79,7 @@ Add the following config to `claude_desktop_config.json`:
 
 `uploadFolder` uploads every regular file under the directory, hidden files and empty files included. Paths in the folder are relative to the directory, so the folder's CID is the one `ipfs add -r --cid-version 1 --raw-leaves <directory>` computes (as long as the directory holds no empty subdirectories or symlinks, which a folder doesn't keep). A symlink to a file is followed only when its target is inside the allowed directories; symlinks to directories, symlinks leaving the allowed directories, empty directories, and names holding `%` are skipped and listed in the result. An empty directory, or a directory outside the allowed directories, is refused.
 
-A folder holds at most `folder_max_files` files (`getUploadLimits`). Upload a directory with more as several folders: one `uploadFolder` call per subset of its files, each with its own `name` and `paths`.
+A folder holds at most `folder_max_files` files (`getUploadLimits`; 30,000 unless the account has its own limit). A new folder of more files is refused before any file is sent, and the error gives the file count of each top-level subdirectory: upload the directory as several folders, one `uploadFolder` call per subdirectory (`directory` set to it, with its own `name`). When files fail because a folder is full (adding files to it with `folderId`), the result gives the arguments that upload them as a new folder under another name instead of sending them into the full folder again.
 
 A successful upload returns the folder's id, name, CID, file count, total size and duration:
 

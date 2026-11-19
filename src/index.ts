@@ -10,7 +10,7 @@ import { ResourceTemplate } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { RequestHandlerExtra } from "@modelcontextprotocol/sdk/shared/protocol.js";
 import type { ServerNotification, ServerRequest } from "@modelcontextprotocol/sdk/types.js";
 import { promisify } from "util";
-import { FolderUploadError, PinataSDK } from "pinata";
+import { FolderUploadError, PinataError, PinataSDK } from "pinata";
 import type { FolderEntry, FolderUploadEvent, FolderUploadOptions } from "pinata";
 
 // Uploads use the global File and fs.openAsBlob, which Node.js added in version 20.
@@ -511,6 +511,35 @@ server.tool(
   }
 );
 
+// The upload limits of the account of PINATA_JWT
+async function fetchUploadLimits(): Promise<{ folder_max_files: number }> {
+  const response = await fetch("https://uploads.pinata.cloud/v3/files/limits", {
+    method: "GET",
+    headers: getHeaders(),
+  });
+  if (!response.ok) {
+    const body = (await response.text().catch(() => "")).slice(0, 500);
+    throw new Error(
+      `Failed to get upload limits: ${response.status} ${response.statusText}${body ? `: ${body}` : ""}`
+    );
+  }
+  const { data } = await response.json();
+  return data;
+}
+
+server.tool(
+  "getUploadLimits",
+  "Get the upload limits of your Pinata account: folder_max_files, the most files one folder can hold (30,000 unless the account has its own limit). uploadFolder refuses a new folder of more files before sending any; upload such a directory as several folders.",
+  {},
+  async () => {
+    try {
+      return successResponse(await fetchUploadLimits());
+    } catch (error) {
+      return errorResponse(error);
+    }
+  }
+);
+
 server.tool(
   "uploadFile",
   "Upload a file to Pinata IPFS. Provide either a file:// URI or base64-encoded content. Files over 90 MiB are sent as resumable uploads, and by default the call returns only once Pinata has registered the file, which for a large file can take several minutes per GiB after the last byte. Progress is reported every 15 seconds to clients that ask for it. If your client times out on long calls, pass waitForCid: false for large files and find the file later with searchFiles by name or CID.",
@@ -770,6 +799,15 @@ function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
+// Pinata refused a new path because the folder holds folder_max_files files already
+function isFolderFull(error: unknown): boolean {
+  return (
+    error instanceof PinataError &&
+    error.statusCode === 413 &&
+    /maximum of \d+ files/.test(error.message)
+  );
+}
+
 // At most LISTED_FILES_MAX items, and how many more there are
 function capList<T>(items: T[]): { listed: T[]; more?: number } {
   return items.length > LISTED_FILES_MAX
@@ -843,7 +881,7 @@ function describeFolderEvent(event: FolderUploadEvent, filePath: string): string
 
 server.tool(
   "uploadFolder",
-  "Upload a local directory to Pinata IPFS as one folder with one CID, keeping its subdirectories. Use this instead of uploadFile when the content is a directory (a website, a dataset, a set of images); use uploadFile for a single file. Every regular file under the directory is sent as its own resumable upload, several at a time, each retried on its own, so a large folder or a flaky connection does not restart from zero. Symlinks are followed only to files inside the allowed directories; skipped entries are listed in the result. When some files fail, the result names them and gives the arguments that send only those files again into the same folder (folderId + paths). Also adds files to an existing folder: pass its folderId and its name (listFolder shows it as root). Progress is reported per file to clients that ask for it.",
+  "Upload a local directory to Pinata IPFS as one folder with one CID, keeping its subdirectories. Use this instead of uploadFile when the content is a directory (a website, a dataset, a set of images); use uploadFile for a single file. Every regular file under the directory is sent as its own resumable upload, several at a time, each retried on its own, so a large folder or a flaky connection does not restart from zero. Symlinks are followed only to files inside the allowed directories; skipped entries are listed in the result. When some files fail, the result names them and gives the arguments that send only those files again into the same folder (folderId + paths). Also adds files to an existing folder: pass its folderId and its name (listFolder shows it as root). A folder holds at most folder_max_files files (see getUploadLimits; 30,000 unless the account has its own limit): a new folder of more files is refused before any is sent, with the file count of each top-level subdirectory, so the directory can be uploaded as several folders, one call per subdirectory (directory set to it, with its own name). Progress is reported per file to clients that ask for it.",
   {
     directory: z
       .string()
@@ -930,6 +968,30 @@ server.tool(
         files = wanted.map((p) => byPath.get(p)!);
       }
 
+      // A new folder holds at most folder_max_files files: refuse more before opening any,
+      // with what a split by subdirectory would look like. When the limit can't be read,
+      // Pinata refuses each file past it on its own.
+      if (!folderId) {
+        const max = (await fetchUploadLimits().catch(() => undefined))?.folder_max_files;
+        if (max !== undefined && files.length > max) {
+          const counts = new Map<string, number>();
+          for (const file of files) {
+            const slash = file.relativePath.indexOf("/");
+            const top = slash === -1 ? "(files directly in the directory)" : file.relativePath.slice(0, slash);
+            counts.set(top, (counts.get(top) ?? 0) + 1);
+          }
+          const split = capList(
+            [...counts].sort((a, b) => b[1] - a[1]).map(([entry, count]) => ({ entry, files: count }))
+          );
+          throw new Error(
+            `${root} has ${files.length} files to upload, but a folder holds at most ${max} (see getUploadLimits). ` +
+              `Upload it as several folders, for example one uploadFolder call per subdirectory (directory: the subdirectory's path, with its own name), ` +
+              `and use paths only for a few loose files. Files per top-level entry:\n${JSON.stringify(split.listed, null, 2)}` +
+              (split.more ? `\nand ${split.more} more` : "")
+          );
+        }
+      }
+
       // Every path starts with the folder name, so the SDK keeps the paths as they are
       const entries: FolderEntry[] = [];
       for (const file of files) {
@@ -987,14 +1049,18 @@ server.tool(
         const failed = error.failed.map((f) => ({
           path: files[f.index].relativePath,
           reason: errorMessage(f.error),
+          folderFull: isFolderFull(f.error),
         }));
-        const failedList = capList(failed);
-        // The arguments of a call that sends the failed files again into the same folder
+        const failedList = capList(failed.map(({ path, reason }) => ({ path, reason })));
+        // A full folder refuses every new path: the files go to a new folder instead
+        const folderFull = failed.some((f) => f.folderFull);
+        // The arguments of a call that sends the failed files again: into the same folder, or
+        // into a new one under another name when the folder is full
         const retry = {
           directory: root,
           network,
-          name: folderName,
-          folderId: error.folderId,
+          name: folderFull ? `${folderName}-2` : folderName,
+          ...(folderFull ? {} : { folderId: error.folderId }),
           ...(group_id ? { group_id } : {}),
           ...(keyvalues ? { keyvalues } : {}),
           ...(cidVersion ? { cidVersion } : {}),
@@ -1005,10 +1071,16 @@ server.tool(
               : {}),
         };
         let next: string;
+        let showRetry = !error.folder?.is_duplicate && failed.length > 0;
         if (error.folder?.is_duplicate) {
           next = "The files uploaded match a folder uploaded earlier, which Pinata kept instead of this one. Call uploadFolder again without folderId to upload every file into a new folder.";
         } else if (failed.length === 0) {
           next = `Every file was uploaded, but Pinata is still finishing the folder. Check it in a few minutes with listFolder (folderId ${error.folderId}).`;
+        } else if (folderFull && failed.length <= RETRY_PATHS_MAX) {
+          next = "The folder is full: it holds the most files a folder can (folder_max_files, see getUploadLimits), so sending these files into it again fails the same way. To upload the failed files as a new folder, call uploadFolder with these arguments:";
+        } else if (folderFull) {
+          next = "The folder is full: it holds the most files a folder can (folder_max_files, see getUploadLimits), and too many files failed to name them all. Upload the rest as new folders, one uploadFolder call per subdirectory (directory: the subdirectory's path, with its own name), without folderId.";
+          showRetry = false;
         } else if (failed.length <= RETRY_PATHS_MAX) {
           next = "To send only the failed files again into the same folder, call uploadFolder with these arguments:";
         } else {
@@ -1027,7 +1099,6 @@ server.tool(
           ...(failedList.more ? { failed_more: `and ${failedList.more} more` } : {}),
           ...skippedReport,
         };
-        const showRetry = !error.folder?.is_duplicate && failed.length > 0;
         return {
           content: [
             {

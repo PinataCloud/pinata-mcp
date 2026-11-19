@@ -64,6 +64,7 @@ Add the following config to `claude_desktop_config.json`:
 | Tool | Description |
 |------|-------------|
 | `uploadFile` | Upload a file to Pinata (public or private IPFS). Files over 90 MiB use resumable uploads and can be any size. A large upload returns once Pinata has registered the file, which can take several minutes per GiB; the server reports progress every 15 seconds to clients that ask for it. If your client times out first, pass `waitForCid: false` to return once the bytes are stored, then find the file with `searchFiles` |
+| `getUploadLimits` | Get your account's upload limits: `folder_max_files`, the most files one folder can hold (30,000 unless the account has its own limit) |
 | `searchFiles` | Search files by name, CID, or MIME type |
 | `getFileById` | Get detailed file information by ID |
 | `updateFile` | Update file metadata (name, key-values) |
@@ -77,6 +78,8 @@ Add the following config to `claude_desktop_config.json`:
 | `listFolder` | List one level of a folder: files and subdirectories with names, paths, sizes and CIDs, the folder's CID and root name, and whether files can still be added (`appendable`, `appendable_until`). Accepts `path` for a subdirectory, `limit` and `pageToken` |
 
 `uploadFolder` uploads every regular file under the directory, hidden files and empty files included. Paths in the folder are relative to the directory, so the folder's CID is the one `ipfs add -r --cid-version 1 --raw-leaves <directory>` computes (as long as the directory holds no empty subdirectories or symlinks, which a folder doesn't keep). A symlink to a file is followed only when its target is inside the allowed directories; symlinks to directories, symlinks leaving the allowed directories, empty directories, and names holding `%` are skipped and listed in the result. An empty directory, or a directory outside the allowed directories, is refused.
+
+A folder holds at most `folder_max_files` files (`getUploadLimits`; 30,000 unless the account has its own limit). A new folder of more files is refused before any file is sent, and the error gives the file count of each top-level subdirectory: upload the directory as several folders, one `uploadFolder` call per subdirectory (`directory` set to it, with its own `name`). When files fail because a folder is full (adding files to it with `folderId`), the result gives the arguments that upload them as a new folder under another name instead of sending them into the full folder again.
 
 A successful upload returns the folder's id, name, CID, file count, total size and duration:
 

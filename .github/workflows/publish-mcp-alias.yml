@@ -1,0 +1,66 @@
+name: Publish @pinata/mcp alias
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "packages/mcp-alias/**"
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: Check version
+    runs-on: ubuntu-latest
+    outputs:
+      publish: ${{ steps.check.outputs.publish }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Check if this version is already published
+        id: check
+        working-directory: packages/mcp-alias
+        run: |
+          VERSION=$(node -p "require('./package.json').version")
+          if npm view "@pinata/mcp@$VERSION" version >/dev/null 2>&1; then
+            echo "@pinata/mcp@$VERSION is already on npm, skipping."
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  publish:
+    name: Publish to npm
+    needs: check
+    if: needs.check.outputs.publish == 'true'
+    runs-on: ubuntu-latest
+    # Protected environment: requires approval, and only main / v* tags can deploy.
+    # npm's trusted publisher for `@pinata/mcp` only accepts OIDC tokens from this environment.
+    environment: npm-publish
+    permissions:
+      contents: read
+      id-token: write # npm trusted publishing (OIDC) + provenance
+    defaults:
+      run:
+        working-directory: packages/mcp-alias
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Install dependencies
+        run: npm install --no-package-lock --no-audit --no-fund
+
+      - name: Run tests
+        run: npm test
+
+      # The dist-tag comes from publishConfig.tag in package.json
+      - name: Publish
+        run: npm publish --provenance --access public

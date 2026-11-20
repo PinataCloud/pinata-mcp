@@ -170,7 +170,7 @@ Tools for cryptographic content verification using EIP-712 signatures:
 
 | Tool | Description |
 |------|-------------|
-| `createSignedUploadUrl` | Create a presigned URL for client-side uploads |
+| `createSignedUploadUrl` | Create a presigned URL for client-side uploads. `network` (`public` or `private`) fixes where every upload through the URL goes; left out, the upload's own `network` field decides (private if it sends none) |
 
 ### Pin by CID
 

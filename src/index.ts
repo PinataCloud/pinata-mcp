@@ -2213,6 +2213,10 @@ server.tool(
   "createSignedUploadUrl",
   "Create a signed URL for client-side file uploads without exposing your API key",
   {
+    network: z
+      .enum(["public", "private"])
+      .optional()
+      .describe("Network every upload through this URL goes to, whatever the upload itself asks for. Left out, the upload's own network field decides (private if it sends none)"),
     expires: z
       .number()
       .describe("How long the URL is valid in seconds after signing"),
@@ -2237,13 +2241,14 @@ server.tool(
       .optional()
       .describe("Metadata key-value pairs for the file"),
   },
-  async ({ expires, max_file_size, allow_mime_types, group_id, filename, keyvalues }) => {
+  async ({ network, expires, max_file_size, allow_mime_types, group_id, filename, keyvalues }) => {
     try {
       const url = "https://uploads.pinata.cloud/v3/files/sign";
       const date = Math.floor(Date.now() / 1000);
 
       const payload: {
         date: number;
+        network?: "public" | "private";
         expires: number;
         max_file_size?: number;
         allow_mime_types?: string[];
@@ -2252,6 +2257,7 @@ server.tool(
         keyvalues?: Record<string, string>;
       } = { date, expires };
 
+      if (network) payload.network = network;
       if (max_file_size) payload.max_file_size = max_file_size;
       if (allow_mime_types) payload.allow_mime_types = allow_mime_types;
       if (group_id) payload.group_id = group_id;

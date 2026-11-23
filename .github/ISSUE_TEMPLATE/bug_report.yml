@@ -1,0 +1,43 @@
+name: Bug report
+description: A Pinata MCP tool fails or behaves wrongly
+labels: [bug]
+body:
+  - type: dropdown
+    id: server
+    attributes:
+      label: Server
+      description: Hosted is https://mcp.pinata.cloud; local is the `pinata-mcp` npm package.
+      options:
+        - Hosted (mcp.pinata.cloud)
+        - Local (npx pinata-mcp)
+    validations:
+      required: true
+  - type: input
+    id: client
+    attributes:
+      label: Client
+      description: The app or agent and its version, e.g. Claude Code 2.1, Cursor 1.8, Codex CLI
+    validations:
+      required: true
+  - type: input
+    id: tool
+    attributes:
+      label: Tool
+      description: The tool that failed, e.g. uploadContent, fetchFromGateway
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What you asked, what the tool returned, and what you expected. Paste the error text. Never paste your API key (JWT). For account, billing or data questions, email team@pinata.cloud instead.
+    validations:
+      required: true
+  - type: input
+    id: when
+    attributes:
+      label: When
+      description: Date and time with timezone, and the request_id from the error if there is one (hosted only). These let us find the request in our logs.
+  - type: input
+    id: version
+    attributes:
+      label: pinata-mcp version
+      description: Local only, e.g. 0.7.0. Your client shows it as the server version, or check the version pinned in your MCP config

@@ -72,6 +72,8 @@ Add the following config to `claude_desktop_config.json`:
 | `updateFile` | Update file metadata (name, key-values) |
 | `deleteFile` | Delete a file from Pinata |
 
+Tools that take a file or group ID (`getFileById`, `updateFile`, `deleteFile`, `getGroup`, `updateGroup`, `deleteGroup`, `addFileToGroup`, `removeFileFromGroup`) find it on public or private IPFS when `network` is left out. IDs must be UUIDs.
+
 ### Folder Operations
 
 | Tool | Description |
@@ -129,6 +131,8 @@ returns the folder's `cid`, `root`, `appendable`, `appendable_until`, `entries` 
 | `createPrivateDownloadLink` | Generate a temporary download link for private files |
 | `fetchFromGateway` | Fetch content from IPFS via Pinata gateway |
 
+If `GATEWAY_URL` has [access controls](https://docs.pinata.cloud/gateways/gateway-access-controls) (access tokens, allowed hosts or IPs), public `/ipfs/` links through it open only with a token or from an allowed host or IP. `fetchFromGateway` then reads your public files through a signed link instead, and `createLink` adds a temporary link anyone can open until it expires (`expires`).
+
 ### Group Operations
 
 | Tool | Description |
@@ -158,7 +162,7 @@ Tools for content monetization using the x402 protocol:
 
 ### CID Signatures
 
-Tools for cryptographic content verification using EIP-712 signatures:
+Tools for cryptographic content verification using EIP-712 signatures, for public CIDs:
 
 | Tool | Description |
 |------|-------------|
@@ -177,7 +181,7 @@ Tools for cryptographic content verification using EIP-712 signatures:
 | Tool | Description |
 |------|-------------|
 | `pinByCid` | Pin an existing CID from the IPFS network |
-| `queryPinRequests` | Query the status of pin requests |
+| `queryPinRequests` | Query the status of pin requests, by one or several statuses: `prechecking`, `searching`, `retrieving`, `downloaded`, `backfilled`, `expired`, `cancelled` |
 | `cancelPinRequest` | Cancel a pending pin request |
 
 ### Vectorize (AI/Semantic Search)

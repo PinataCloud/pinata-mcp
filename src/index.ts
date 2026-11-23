@@ -308,6 +308,113 @@ const successResponse = (data: unknown) => ({
   content: [{ type: "text" as const, text: JSON.stringify(data, null, 2) }],
 });
 
+// File and group IDs are UUIDs. A free-form ID becomes part of the URL path, where "../" would
+// walk to another endpoint with the user's JWT.
+const resourceId = z
+  .string()
+  .regex(/^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/i, "must be a UUID");
+
+// A CID in a URL path: letters and digits only.
+const cidInPath = z.string().regex(/^[A-Za-z0-9]+$/, "must be a CID");
+
+type Network = "public" | "private";
+const NETWORKS: readonly Network[] = ["public", "private"];
+
+// For tools that take an ID: an ID names one item on one network, so both can be tried.
+const anyNetwork = (what: string) =>
+  z
+    .enum(["public", "private"])
+    .optional()
+    .describe(`Whether the ${what} is on public or private IPFS. Left out, public and then private are tried.`);
+
+// Sends the request on the given network, or on public and then private when public answers 404.
+async function fetchOnNetwork(
+  network: Network | undefined,
+  url: (network: Network) => string,
+  init: RequestInit
+): Promise<Response> {
+  if (network) return fetch(url(network), init);
+  const response = await fetch(url("public"), init);
+  if (response.status !== 404) return response;
+  await response.body?.cancel();
+  return fetch(url("private"), init);
+}
+
+// The network a group is on. Adding a file to a group on the wrong network answers 403, not 404,
+// so membership changes look the group up first instead of retrying.
+async function groupNetwork(network: Network | undefined, groupId: string): Promise<Network> {
+  if (network) return network;
+  for (const candidate of NETWORKS) {
+    const response = await fetch(`https://api.pinata.cloud/v3/groups/${candidate}/${groupId}`, {
+      method: "GET",
+      headers: getHeaders(),
+    });
+    await response.body?.cancel();
+    if (response.ok) return candidate;
+    if (response.status !== 404) {
+      throw new Error(`Failed to look up group: ${response.status} ${response.statusText}`);
+    }
+  }
+  throw new Error(`Group ${groupId} was not found on public or private IPFS`);
+}
+
+// A temporary signed link to a file on GATEWAY_URL, from POST /v3/files/private/download_link.
+// Signed /files/ links skip gateway access controls, so they also open public files on a gateway
+// that has access tokens, allowed hosts or allowed IPs.
+async function signedFilesLink(cid: string, expires: number): Promise<{ url: string; expiresAt: Date }> {
+  if (!GATEWAY_URL) {
+    throw new Error("GATEWAY_URL environment variable is not set");
+  }
+  const date = Math.floor(Date.now() / 1000);
+  const response = await fetch("https://api.pinata.cloud/v3/files/private/download_link", {
+    method: "POST",
+    headers: getHeaders(),
+    body: JSON.stringify({ url: `https://${GATEWAY_URL}/files/${cid}`, expires, date, method: "GET" }),
+  });
+  if (!response.ok) {
+    const errorText = await response.text();
+    throw new Error(
+      `Failed to create download link: ${response.status} ${response.statusText}. Response: ${errorText}`
+    );
+  }
+  const { data } = await response.json();
+  return { url: data, expiresAt: new Date((date + expires) * 1000) };
+}
+
+// Whether GATEWAY_URL has access controls (access tokens, allowed hosts or allowed IPs). Such a
+// gateway answers 401 to /ipfs/ requests that carry none of them, so a public link through it
+// opens only for those. Only whether controls exist is read, never their values. null: unknown.
+const ACCESS_CONTROLS_TTL_MS = 5 * 60 * 1000;
+let accessControlsCache: { value: Promise<boolean | null>; at: number } | undefined;
+
+function gatewayHasAccessControls(): Promise<boolean | null> {
+  if (accessControlsCache && Date.now() - accessControlsCache.at < ACCESS_CONTROLS_TTL_MS) {
+    return accessControlsCache.value;
+  }
+  const value = (async (): Promise<boolean | null> => {
+    const host = (GATEWAY_URL ?? "").toLowerCase();
+    const list = await fetch("https://api.pinata.cloud/v3/gateways?pageSize=100", { headers: getHeaders() });
+    if (!list.ok) return null;
+    const { data } = await list.json();
+    const rows: { id: string; domain: string; custom_domains?: { domain: string }[] | null }[] = data?.rows ?? [];
+    // GATEWAY_URL is <domain>.<gateway domain> (e.g. example.mypinata.cloud) or a custom domain.
+    const gateway = rows.find(
+      (row) =>
+        host.startsWith(`${row.domain.toLowerCase()}.`) ||
+        (row.custom_domains ?? []).some((custom) => custom.domain.toLowerCase() === host)
+    );
+    if (!gateway || !/^[0-9a-f-]{36}$/i.test(gateway.id)) return null;
+    const detail = await fetch(`https://api.pinata.cloud/v3/gateways/${gateway.id}`, { headers: getHeaders() });
+    if (!detail.ok) return null;
+    const policies = (await detail.json())?.data?.settings?.restriction_policies;
+    return policies
+      ? Object.values(policies).some((values) => Array.isArray(values) && values.length > 0)
+      : false;
+  })().catch(() => null);
+  accessControlsCache = { value, at: Date.now() };
+  return value;
+}
+
 // ============================================================================
 // Authentication
 // ============================================================================
@@ -402,17 +509,12 @@ server.tool(
   "getFileById",
   "Retrieve detailed information about a specific file stored on Pinata by its ID",
   {
-    network: z
-      .enum(["public", "private"])
-      .default("public")
-      .describe("Whether the file is in public or private IPFS"),
-    id: z.string().describe("The unique ID of the file to retrieve"),
+    network: anyNetwork("file"),
+    id: resourceId.describe("The unique ID of the file to retrieve"),
   },
   async ({ network, id }) => {
     try {
-      const url = `https://api.pinata.cloud/v3/files/${network}/${id}`;
-
-      const response = await fetch(url, {
+      const response = await fetchOnNetwork(network, (net) => `https://api.pinata.cloud/v3/files/${net}/${id}`, {
         method: "GET",
         headers: getHeaders(),
       });
@@ -435,11 +537,8 @@ server.tool(
   "updateFile",
   "Update metadata for an existing file on Pinata including name and key-value pairs",
   {
-    network: z
-      .enum(["public", "private"])
-      .default("public")
-      .describe("Whether the file is in public or private storage"),
-    id: z.string().describe("The unique ID of the file to update"),
+    network: anyNetwork("file"),
+    id: resourceId.describe("The unique ID of the file to update"),
     name: z.string().optional().describe("New name for the file"),
     keyvalues: z
       .record(z.string(), z.string())
@@ -448,14 +547,12 @@ server.tool(
   },
   async ({ network, id, name, keyvalues }) => {
     try {
-      const url = `https://api.pinata.cloud/v3/files/${network}/${id}`;
-
       const payload: { name?: string; keyvalues?: Record<string, string> } =
         {};
       if (name) payload.name = name;
       if (keyvalues) payload.keyvalues = keyvalues;
 
-      const response = await fetch(url, {
+      const response = await fetchOnNetwork(network, (net) => `https://api.pinata.cloud/v3/files/${net}/${id}`, {
         method: "PUT",
         headers: getHeaders(),
         body: JSON.stringify(payload),
@@ -479,17 +576,12 @@ server.tool(
   "deleteFile",
   "Delete a file from your Pinata account by its ID",
   {
-    network: z
-      .enum(["public", "private"])
-      .default("public")
-      .describe("Whether the file is in public or private IPFS"),
-    id: z.string().describe("The unique ID of the file to delete"),
+    network: anyNetwork("file"),
+    id: resourceId.describe("The unique ID of the file to delete"),
   },
   async ({ network, id }) => {
     try {
-      const url = `https://api.pinata.cloud/v3/files/${network}/${id}`;
-
-      const response = await fetch(url, {
+      const response = await fetchOnNetwork(network, (net) => `https://api.pinata.cloud/v3/files/${net}/${id}`, {
         method: "DELETE",
         headers: getHeaders(),
       });
@@ -1254,7 +1346,7 @@ server.tool(
       .number()
       .default(600)
       .describe(
-        "Expiration time in seconds for private download links (default: 600)"
+        "Expiration time in seconds for private download links, and for the temporary link of a public file on a gateway with access controls (default: 600)"
       ),
   },
   async ({ cid, network, expires = 600 }) => {
@@ -1265,6 +1357,17 @@ server.tool(
 
       if (network === "public") {
         const fileUrl = `https://${GATEWAY_URL}/ipfs/${cid}`;
+        if (await gatewayHasAccessControls()) {
+          const temporary = await signedFilesLink(cid, expires);
+          return {
+            content: [
+              {
+                type: "text",
+                text: `✅ Public IPFS link:\n${fileUrl}\n\n⚠️ ${GATEWAY_URL} has access controls: this link opens only with one of the gateway's access tokens (pinataGatewayToken) or from its allowed hosts or IPs.\n\nTemporary link anyone can open until ${temporary.expiresAt.toLocaleString()} (set with expires):\n${temporary.url}`,
+              },
+            ],
+          };
+        }
         return {
           content: [
             {
@@ -1368,7 +1471,14 @@ server.tool(
         fileUrl = linkData.data;
       }
 
-      const response = await fetch(fileUrl);
+      let response = await fetch(fileUrl);
+
+      // A gateway with access controls refuses /ipfs/ without a token, but serves the account's
+      // own files through a signed /files/ link, which skips access controls.
+      if (network === "public" && (response.status === 401 || response.status === 403)) {
+        await response.body?.cancel();
+        response = await fetch((await signedFilesLink(cid, 600)).url);
+      }
 
       if (!response.ok) {
         throw new Error(
@@ -1502,17 +1612,12 @@ server.tool(
   "getGroup",
   "Retrieve detailed information about a specific group by its ID",
   {
-    network: z
-      .enum(["public", "private"])
-      .default("public")
-      .describe("Whether the group is in public or private IPFS"),
-    id: z.string().describe("The unique ID of the group to retrieve"),
+    network: anyNetwork("group"),
+    id: resourceId.describe("The unique ID of the group to retrieve"),
   },
   async ({ network, id }) => {
     try {
-      const url = `https://api.pinata.cloud/v3/groups/${network}/${id}`;
-
-      const response = await fetch(url, {
+      const response = await fetchOnNetwork(network, (net) => `https://api.pinata.cloud/v3/groups/${net}/${id}`, {
         method: "GET",
         headers: getHeaders(),
       });
@@ -1535,21 +1640,16 @@ server.tool(
   "updateGroup",
   "Update metadata for an existing group on Pinata",
   {
-    network: z
-      .enum(["public", "private"])
-      .default("public")
-      .describe("Whether the group is in public or private IPFS"),
-    id: z.string().describe("The unique ID of the group to update"),
+    network: anyNetwork("group"),
+    id: resourceId.describe("The unique ID of the group to update"),
     name: z.string().optional().describe("New name for the group"),
   },
   async ({ network, id, name }) => {
     try {
-      const url = `https://api.pinata.cloud/v3/groups/${network}/${id}`;
-
       const payload: { name?: string } = {};
       if (name) payload.name = name;
 
-      const response = await fetch(url, {
+      const response = await fetchOnNetwork(network, (net) => `https://api.pinata.cloud/v3/groups/${net}/${id}`, {
         method: "PUT",
         headers: getHeaders(),
         body: JSON.stringify(payload),
@@ -1573,17 +1673,12 @@ server.tool(
   "deleteGroup",
   "Delete a group from your Pinata account by its ID",
   {
-    network: z
-      .enum(["public", "private"])
-      .default("public")
-      .describe("Whether the group is in public or private IPFS"),
-    id: z.string().describe("The unique ID of the group to delete"),
+    network: anyNetwork("group"),
+    id: resourceId.describe("The unique ID of the group to delete"),
   },
   async ({ network, id }) => {
     try {
-      const url = `https://api.pinata.cloud/v3/groups/${network}/${id}`;
-
-      const response = await fetch(url, {
+      const response = await fetchOnNetwork(network, (net) => `https://api.pinata.cloud/v3/groups/${net}/${id}`, {
         method: "DELETE",
         headers: getHeaders(),
       });
@@ -1613,16 +1708,14 @@ server.tool(
   "addFileToGroup",
   "Add an existing file to a group in your Pinata account",
   {
-    network: z
-      .enum(["public", "private"])
-      .default("public")
-      .describe("Whether the group and file are in public or private IPFS"),
-    groupId: z.string().describe("The ID of the group to add the file to"),
-    fileId: z.string().describe("The ID of the file to add to the group"),
+    network: anyNetwork("group and file"),
+    groupId: resourceId.describe("The ID of the group to add the file to"),
+    fileId: resourceId.describe("The ID of the file to add to the group"),
   },
   async ({ network, groupId, fileId }) => {
     try {
-      const url = `https://api.pinata.cloud/v3/groups/${network}/${groupId}/ids/${fileId}`;
+      const net = await groupNetwork(network, groupId);
+      const url = `https://api.pinata.cloud/v3/groups/${net}/${groupId}/ids/${fileId}`;
 
       const response = await fetch(url, {
         method: "PUT",
@@ -1654,18 +1747,14 @@ server.tool(
   "removeFileFromGroup",
   "Remove a file from a group in your Pinata account",
   {
-    network: z
-      .enum(["public", "private"])
-      .default("public")
-      .describe("Whether the group and file are in public or private IPFS"),
-    groupId: z
-      .string()
-      .describe("The ID of the group to remove the file from"),
-    fileId: z.string().describe("The ID of the file to remove from the group"),
+    network: anyNetwork("group and file"),
+    groupId: resourceId.describe("The ID of the group to remove the file from"),
+    fileId: resourceId.describe("The ID of the file to remove from the group"),
   },
   async ({ network, groupId, fileId }) => {
     try {
-      const url = `https://api.pinata.cloud/v3/groups/${network}/${groupId}/ids/${fileId}`;
+      const net = await groupNetwork(network, groupId);
+      const url = `https://api.pinata.cloud/v3/groups/${net}/${groupId}/ids/${fileId}`;
 
       const response = await fetch(url, {
         method: "DELETE",
@@ -2092,17 +2181,16 @@ server.tool(
   "addSignature",
   "Add an EIP-712 cryptographic signature to a CID for content verification",
   {
-    network: z
-      .enum(["public", "private"])
-      .default("public")
-      .describe("Whether the file is on public or private IPFS"),
-    cid: z.string().describe("The CID to sign"),
+    cid: cidInPath.describe("The CID to sign (public CIDs only: Pinata signs public CIDs)"),
     signature: z.string().describe("The EIP-712 signature"),
-    address: z.string().describe("The wallet address that created the signature"),
+    address: z
+      .string()
+      .regex(/^0x[0-9a-fA-F]{40}$/, "must be a 0x wallet address")
+      .describe("The wallet address that created the signature"),
   },
-  async ({ network, cid, signature, address }) => {
+  async ({ cid, signature, address }) => {
     try {
-      const url = `https://api.pinata.cloud/v3/files/${network}/signature/${cid}`;
+      const url = `https://api.pinata.cloud/v3/files/public/signature/${cid}`;
 
       const response = await fetch(url, {
         method: "POST",
@@ -2136,15 +2224,11 @@ server.tool(
   "getSignature",
   "Get signature details for a specific CID",
   {
-    network: z
-      .enum(["public", "private"])
-      .default("public")
-      .describe("Whether the file is on public or private IPFS"),
-    cid: z.string().describe("The CID to get the signature for"),
+    cid: cidInPath.describe("The CID to get the signature for (public CIDs only: Pinata signs public CIDs)"),
   },
-  async ({ network, cid }) => {
+  async ({ cid }) => {
     try {
-      const url = `https://api.pinata.cloud/v3/files/${network}/signature/${cid}`;
+      const url = `https://api.pinata.cloud/v3/files/public/signature/${cid}`;
 
       const response = await fetch(url, {
         method: "GET",
@@ -2169,15 +2253,11 @@ server.tool(
   "deleteSignature",
   "Remove a signature from a CID",
   {
-    network: z
-      .enum(["public", "private"])
-      .default("public")
-      .describe("Whether the file is on public or private IPFS"),
-    cid: z.string().describe("The CID to remove the signature from"),
+    cid: cidInPath.describe("The CID to remove the signature from (public CIDs only: Pinata signs public CIDs)"),
   },
-  async ({ network, cid }) => {
+  async ({ cid }) => {
     try {
-      const url = `https://api.pinata.cloud/v3/files/${network}/signature/${cid}`;
+      const url = `https://api.pinata.cloud/v3/files/public/signature/${cid}`;
 
       const response = await fetch(url, {
         method: "DELETE",
@@ -2259,7 +2339,8 @@ server.tool(
 
       if (network) payload.network = network;
       if (max_file_size) payload.max_file_size = max_file_size;
-      if (allow_mime_types) payload.allow_mime_types = allow_mime_types;
+      // A folder upload's MIME type is checked as "directory", so a list without it refuses folders.
+      if (allow_mime_types) payload.allow_mime_types = [...new Set([...allow_mime_types, "directory"])];
       if (group_id) payload.group_id = group_id;
       if (filename) payload.filename = filename;
       if (keyvalues) payload.keyvalues = keyvalues;
@@ -2357,6 +2438,17 @@ server.tool(
   }
 );
 
+// Pin-by-CID job statuses, as Pinata's API names them.
+const PIN_STATUSES = [
+  "prechecking",
+  "searching",
+  "retrieving",
+  "downloaded",
+  "backfilled",
+  "expired",
+  "cancelled",
+] as const;
+
 server.tool(
   "queryPinRequests",
   "Query the status of pin by CID requests",
@@ -2366,19 +2458,11 @@ server.tool(
       .optional()
       .describe("Sort by date_queued"),
     status: z
-      .enum([
-        "prechecking",
-        "backfilled",
-        "retreiving",
-        "expired",
-        "searching",
-        "over_free_limit",
-        "over_max_size",
-        "invalid_object",
-        "bad_host_node",
-      ])
+      .union([z.enum(PIN_STATUSES), z.array(z.enum(PIN_STATUSES)).min(1)])
       .optional()
-      .describe("Filter by status"),
+      .describe(
+        "Filter by status, or by any of several: prechecking, searching and retrieving are in progress; downloaded and backfilled are done; expired means the CID was not found in time; cancelled was cancelled"
+      ),
     cid: z.string().optional().describe("Filter by CID"),
     limit: z.number().optional().describe("Limit number of results"),
     pageToken: z.string().optional().describe("Token for pagination"),
@@ -2387,7 +2471,9 @@ server.tool(
     try {
       const params = new URLSearchParams();
       if (order) params.append("order", order);
-      if (status) params.append("status", status);
+      for (const one of typeof status === "string" ? [status] : status ?? []) {
+        params.append("status", one);
+      }
       if (cid) params.append("cid", cid);
       if (limit) params.append("limit", limit.toString());
       if (pageToken) params.append("pageToken", pageToken);
